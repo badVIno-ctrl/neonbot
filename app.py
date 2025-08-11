@@ -1,12 +1,27 @@
 import asyncio
 import logging
 import os
+import asyncio
+import logging
+import os
 import re
 import json
 import math
-import errno
 import ctypes
-import errno
+import calendar
+import contextlib
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, UTC
+from typing import Dict, List, Optional, Tuple, Any, Set
+from concurrent.futures import ThreadPoolExecutor
+from time import time
+from urllib.parse import quote_plus
+
+import atexit
+import signal
+import re
+import json
+import math
 import ctypes
 import calendar
 import contextlib
@@ -31,9 +46,11 @@ from aiogram.filters import Command, CommandObject, Filter
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
-
+from dotenv import load_dotenv
+load_dotenv()
+DISABLE_LOCK = os.getenv("DISABLE_LOCK", "0") == "1"
 try:
-    from prometheus_client import start_http_server, Counter
+    from prometheus_client import start_http_server, Counter, Gauge
     PROMETHEUS_OK = True
 except Exception:
     PROMETHEUS_OK = False
@@ -45,6 +62,19 @@ CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@NeonFakTrading").strip()
 DB_PATH = os.getenv("DB_PATH", "neon_bot.db").strip()
 LOCK_PATH = os.getenv("LOCK_PATH", "neon_bot.lock").strip()
 METRICS_PORT = int(os.getenv("METRICS_PORT", "0").strip() or "0")
+
+ADMIN_ACCESS_CODE = os.getenv("UNLIMITED_CODE", "2604").strip()
+ADMIN_CODE = os.getenv("ADMIN_CODE", "admin2604").strip()
+
+# Тюнингуемые пороги из .env
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.10"))
+MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "1.80"))
+ADX_MIN = float(os.getenv("ADX_MIN", "18.0"))
+MTF_MIN_VOTES = int(os.getenv("MTF_MIN_VOTES", "2"))
+BIG_CANDLE_MULT = float(os.getenv("BIG_CANDLE_MULT", "1.6"))
+SQUEEZE_LOOKBACK = int(os.getenv("SQUEEZE_LOOKBACK", "20"))
+SQUEEZE_VOL_MULT = float(os.getenv("SQUEEZE_VOL_MULT", "1.2"))
+TRAIL_ATR_CAP = float(os.getenv("TRAIL_ATR_CAP", "0.30"))
 
 DEFAULT_CP_TOKENS = [
     "bdcf4a18c17ba8c14431aca8aa728b9c69c4f553",
@@ -79,18 +109,14 @@ router = Router()
 tz = pytz.timezone(TZ_NAME)
 
 DAILY_LIMIT = 3
-ADMIN_ACCESS_CODE = "2604"
 
 NEWS_TTL = 300
 news_cache: Dict[str, Tuple[float, Tuple[float, str]]] = {}
 cp_token_cooldowns: Dict[str, float] = {}
 cp_token_index: int = 0
 
-EXECUTOR = ThreadPoolExecutor(max_workers=3)
+EXECUTOR = ThreadPoolExecutor(max_workers=4)
 APP_STARTED_AT = datetime.now(UTC)
-
-MIN_ATR_PCT = 0.10
-MAX_ATR_PCT = 1.80
 
 VOL_THRESHOLDS_USDT = {
     "BTC": 20_000_000, "ETH": 10_000_000, "SOL": 3_000_000, "TON": 1_500_000, "SUI": 600_000, "XRP": 4_000_000, "ENA": 300_000, "ADA": 2_000_000,
@@ -208,6 +234,19 @@ def entry_time_utc(entry) -> datetime:
     ts = calendar.timegm(tm)
     return datetime.fromtimestamp(ts, UTC)
 
+# ------------------------ Timeframes / incomplete bars ------------------------
+TIMEFRAME_SEC = {"1m":60,"3m":180,"5m":300,"15m":900,"1h":3600,"4h":14400,"1d":86400,"1w":604800}
+
+def drop_incomplete(df: Optional[pd.DataFrame], timeframe: str) -> Optional[pd.DataFrame]:
+    if df is None or df.empty:
+        return df
+    last_ts = df["ts"].iloc[-1].to_pydatetime().replace(tzinfo=UTC)
+    sec = TIMEFRAME_SEC.get(timeframe, 0)
+    if sec and (datetime.now(UTC) - last_ts).total_seconds() < sec - 2:
+        return df.iloc[:-1].copy()
+    return df
+
+# ------------------------ Database ------------------------
 class Database:
     def __init__(self, path: str):
         self.path = path
@@ -220,33 +259,39 @@ class Database:
         await self.conn.execute("CREATE TABLE IF NOT EXISTS signals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL, entry REAL NOT NULL, tps TEXT NOT NULL, sl REAL NOT NULL, leverage INTEGER NOT NULL, risk_level INTEGER NOT NULL, created_at TEXT NOT NULL, news_note TEXT, atr_value REAL, active INTEGER NOT NULL, tp_hit INTEGER NOT NULL, watch_until TEXT NOT NULL)")
         await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_user_active ON signals(user_id, active)")
         await self.conn.execute("CREATE TABLE IF NOT EXISTS backtest (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, pairs TEXT NOT NULL, days INTEGER NOT NULL, trades INTEGER NOT NULL, tp1 INTEGER NOT NULL, tp2 INTEGER NOT NULL, tp3 INTEGER NOT NULL, stops INTEGER NOT NULL)")
-        try:
-            await self.conn.execute("ALTER TABLE users ADD COLUMN support_mode INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
+        # add columns if missing
+        for stmt in [
+            "ALTER TABLE users ADD COLUMN support_mode INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN admin INTEGER NOT NULL DEFAULT 0",
+        ]:
+            try:
+                await self.conn.execute(stmt)
+            except Exception:
+                pass
         await self.conn.commit()
 
     async def get_user_state(self, user_id: int) -> Dict[str, Any]:
         dkey = today_key()
-        cur = await self.conn.execute("SELECT user_id, date, count, unlimited, support_mode FROM users WHERE user_id=?", (user_id,))
+        cur = await self.conn.execute("SELECT user_id, date, count, unlimited, support_mode, admin FROM users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         if row:
-            date, count, unlimited, support_mode = row["date"], row["count"], bool(row["unlimited"]), bool(row["support_mode"])
+            date, count, unlimited, support_mode, admin = row["date"], row["count"], bool(row["unlimited"]), bool(row["support_mode"]), bool(row["admin"])
             if date != dkey:
                 count = 0
                 date = dkey
                 await self.conn.execute("UPDATE users SET date=?, count=? WHERE user_id=?", (date, count, user_id))
                 await self.conn.commit()
-            return {"date": date, "count": count, "unlimited": unlimited, "support_mode": support_mode}
+            return {"date": date, "count": count, "unlimited": unlimited, "support_mode": support_mode, "admin": admin}
         else:
-            await self.conn.execute("INSERT INTO users (user_id, date, count, unlimited, support_mode) VALUES (?, ?, 0, 0, 0)", (user_id, dkey))
+            await self.conn.execute("INSERT INTO users (user_id, date, count, unlimited, support_mode, admin) VALUES (?, ?, 0, 0, 0, 0)", (user_id, dkey))
             await self.conn.commit()
-            return {"date": dkey, "count": 0, "unlimited": False, "support_mode": False}
+            return {"date": dkey, "count": 0, "unlimited": False, "support_mode": False, "admin": False}
 
     async def save_user_state(self, user_id: int, state: Dict[str, Any]):
         await self.conn.execute(
-            "INSERT INTO users (user_id, date, count, unlimited, support_mode) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET date=excluded.date, count=excluded.count, unlimited=excluded.unlimited, support_mode=excluded.support_mode",
-            (user_id, state.get("date", today_key()), int(state.get("count", 0)), 1 if state.get("unlimited", False) else 0, 1 if state.get("support_mode", False) else 0),
+            "INSERT INTO users (user_id, date, count, unlimited, support_mode, admin) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET date=excluded.date, count=excluded.count, unlimited=excluded.unlimited, support_mode=excluded.support_mode, admin=excluded.admin",
+            (user_id, state.get("date", today_key()), int(state.get("count", 0)), 1 if state.get("unlimited", False) else 0, 1 if state.get("support_mode", False) else 0, 1 if state.get("admin", False) else 0),
         )
         await self.conn.commit()
 
@@ -282,12 +327,13 @@ class Database:
         await self.conn.commit()
 
     async def get_admin_user_ids(self) -> List[int]:
-        cur = await self.conn.execute("SELECT user_id FROM users WHERE unlimited=1")
+        cur = await self.conn.execute("SELECT user_id FROM users WHERE admin=1")
         rows = await cur.fetchall()
         return [int(r["user_id"]) for r in rows]
 
 db: Optional[Database] = None
 
+# ------------------------ Market client with better resolve + LRU cache ------------------------
 class MarketClient:
     def __init__(self, priority: List[str]):
         import ccxt
@@ -297,6 +343,7 @@ class MarketClient:
         self.ohlcv_cache: Dict[Tuple[str, str, str], Tuple[float, pd.DataFrame]] = {}
         self.symbol_map_cache: Dict[Tuple[str, str], Optional[str]] = {}
         self.OHLCV_TTL = 60
+        self.MAX_OHLCV_CACHE = 500
         for name in priority:
             try:
                 ex = getattr(ccxt, name)({"enableRateLimit": True, "timeout": 20000})
@@ -324,19 +371,22 @@ class MarketClient:
                 mq = str(m.get("quote") or "").upper()
                 if mb != base or mq != quote:
                     continue
-                t = m.get("type") or ("swap" if m.get("swap") else "spot")
+                # явные приоритеты: линейный USDT swap > USDT spot > всё остальное
+                t_swap = bool(m.get("swap"))
+                t_spot = bool(m.get("spot"))
                 is_linear = bool(m.get("linear"))
                 is_contract = bool(m.get("contract"))
+                # score
                 score = 0
-                if t == "swap":
+                if t_swap and is_linear and mq == "USDT":
+                    score += 10
+                if t_swap:
                     score += 3
                 if is_contract:
                     score += 2
-                if is_linear:
-                    score += 1
                 if ":USDT" in mkey:
                     score += 1
-                if t == "spot":
+                if t_spot:
                     score += 1
                 if score > best_score:
                     best = mkey
@@ -348,6 +398,15 @@ class MarketClient:
         self.symbol_map_cache[key] = best
         return best
 
+    def _prune_ohlcv_cache(self):
+        if len(self.ohlcv_cache) <= self.MAX_OHLCV_CACHE:
+            return
+        # удалить самые старые записи
+        items = sorted(self.ohlcv_cache.items(), key=lambda kv: kv[1][0])
+        to_del = len(self.ohlcv_cache) - self.MAX_OHLCV_CACHE
+        for k, _ in items[:to_del]:
+            self.ohlcv_cache.pop(k, None)
+
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 250) -> Optional[pd.DataFrame]:
         ts = time()
         last_error = None
@@ -356,16 +415,23 @@ class MarketClient:
             cache_key = (name, resolved, timeframe)
             cached = self.ohlcv_cache.get(cache_key)
             if cached and ts - cached[0] < self.OHLCV_TTL:
+                if PROMETHEUS_OK: MET_OHLCV_CACHE_HIT.inc()
                 return cached[1].copy()
             if resolved not in ex.markets:
                 continue
             try:
+                t0 = time()
                 data = ex.fetch_ohlcv(resolved, timeframe=timeframe, limit=limit)
+                if PROMETHEUS_OK: MET_OHLCV_LATENCY.observe(time() - t0)
                 if not data:
                     continue
                 df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
                 df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                df = drop_incomplete(df, timeframe)
+                if df is None or df.empty:
+                    continue
                 self.ohlcv_cache[cache_key] = (ts, df)
+                self._prune_ohlcv_cache()
                 return df.copy()
             except Exception as e:
                 last_error = e
@@ -409,7 +475,9 @@ class MarketClient:
             if resolved not in ex.markets:
                 continue
             try:
+                t0 = time()
                 t = ex.fetch_ticker(resolved)
+                if PROMETHEUS_OK: MET_TICKER_LATENCY.observe(time() - t0)
                 if not isinstance(t, dict):
                     continue
                 out = {
@@ -430,18 +498,58 @@ class MarketClient:
         logger.error("Нет ticker для %s. Последняя ошибка: %s", symbol, last_error)
         return None
 
+    def get_market_info(self, symbol: str) -> Optional[Dict[str, Any]]:
+        # вернуть информацию по первому доступному маркету
+        for _, ex in self._available_exchanges():
+            resolved = self.resolve_symbol(ex, symbol) or symbol
+            if resolved in ex.markets:
+                return ex.markets[resolved]
+        return None
+
+    def get_tick_size(self, symbol: str) -> Optional[float]:
+        info = self.get_market_info(symbol)
+        if not info:
+            return None
+        # ccxt различные биржи: 'precision' -> 'price', 'limits'->'price'->'min', 'tickSize' может быть в 'info'
+        tick = None
+        prec = info.get("precision", {})
+        if isinstance(prec, dict) and "price" in prec and isinstance(prec["price"], (int, float)):
+            # precision как число знаков, не шаг
+            p = prec["price"]
+            if p is not None and p >= 0 and p <= 10:
+                tick = 10 ** (-p)
+        if not tick:
+            limits = info.get("limits", {}).get("price", {})
+            if isinstance(limits, dict):
+                step = limits.get("step") or limits.get("min")
+                if step:
+                    tick = float(step)
+        # некоторые биржи кладут в info
+        if not tick:
+            inf = info.get("info", {})
+            for k in ("tickSize", "minPrice"):
+                if k in inf:
+                    try:
+                        tick = float(inf[k])
+                        break
+                    except Exception:
+                        continue
+        return float(tick) if tick else None
+
 market = MarketClient(EXCHANGE_PRIORITY)
+
+# ------------------------ Indicators (Wilder) ------------------------
+def rma(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(alpha=1/period, adjust=False).mean()
 
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def rsi_wilder(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).rolling(period).mean()
-    roll_down = pd.Series(down, index=series.index).rolling(period).mean()
-    rs = roll_up / (roll_down + 1e-9)
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    rs = rma(up, period) / (rma(down, period) + 1e-9)
     return 100.0 - (100.0 / (1.0 + rs))
 
 def macd(series: pd.Series, fast=12, slow=26, signal=9):
@@ -452,13 +560,13 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def atr_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["high"]
     low = df["low"]
     close = df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    return rma(tr, period)
 
 def obv(df: pd.DataFrame) -> pd.Series:
     close = df["close"]
@@ -474,27 +582,28 @@ def bollinger(series: pd.Series, n: int = 20, k: float = 2.0) -> Tuple[pd.Series
     lower = mid - k * std
     return lower, mid, upper
 
-def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def adx_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["high"]
     low = df["low"]
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    close = df["close"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
     tr1 = high - low
-    tr2 = (high - df["close"].shift(1)).abs()
-    tr3 = (low - df["close"].shift(1)).abs()
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr_ = tr.rolling(period).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(period).sum() / (atr_ * period + 1e-9)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(period).sum() / (atr_ * period + 1e-9)
-    dx = (100 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-9))
-    adx_ = dx.rolling(period).mean()
+    atr_ = rma(tr, period)
+    plus_di = 100 * rma(pd.Series(plus_dm, index=df.index), period) / (atr_ + 1e-9)
+    minus_di = 100 * rma(pd.Series(minus_dm, index=df.index), period) / (atr_ + 1e-9)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
+    adx_ = rma(dx, period)
     return adx_
 
 def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Tuple[pd.Series, pd.Series]:
     hl2 = (df["high"] + df["low"]) / 2.0
-    atr_ = atr(df, period)
+    atr_ = atr_wilder(df, period)
     upperband = hl2 + multiplier * atr_
     lowerband = hl2 - multiplier * atr_
     st = pd.Series(index=df.index, dtype=float)
@@ -520,7 +629,7 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> T
 
 def keltner_channels(df: pd.DataFrame, n: int = 20, k: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
     ema_mid = ema(df["close"], n)
-    atr_ = atr(df, n)
+    atr_ = atr_wilder(df, n)
     upper = ema_mid + k * atr_
     lower = ema_mid - k * atr_
     return lower, ema_mid, upper
@@ -530,15 +639,45 @@ def donchian(df: pd.DataFrame, n: int = 20) -> Tuple[pd.Series, pd.Series]:
     lower = df["low"].rolling(n).min()
     return lower, upper
 
+def is_squeeze(df: pd.DataFrame, n: int = 20, bb_k: float = 2.0, kc_k: float = 1.5, lookback: int = 20) -> Tuple[bool, int]:
+    kl, kmid, ku = keltner_channels(df, n, kc_k)
+    lb, mb, ub = bollinger(df["close"], n, bb_k)
+    inside = (ub < ku) & (lb > kl)
+    cnt = int(inside.tail(lookback).sum())
+    # объём при выходе (последняя свеча) выше медианы * мультипликатор — подтверждение
+    vol_med = float(df["volume"].tail(lookback).median() + 1e-9)
+    vol_ok = float(df["volume"].iloc[-1]) >= SQUEEZE_VOL_MULT * vol_med
+    return (cnt >= max(4, lookback // 3) and vol_ok, cnt)
+
+def big_candle(df: pd.DataFrame, atr_mult: float = BIG_CANDLE_MULT, atr_period: int = 14) -> bool:
+    atr_ = atr_wilder(df, atr_period)
+    rng = (df["high"].iloc[-1] - df["low"].iloc[-1]) / (atr_.iloc[-1] + 1e-9)
+    return rng >= atr_mult
+
+def prev_session_levels(df1d: Optional[pd.DataFrame]) -> Tuple[Optional[float], Optional[float]]:
+    if df1d is None or len(df1d) < 2:
+        return None, None
+    prev = df1d.iloc[-2]
+    return float(prev["high"]), float(prev["low"])
+
+def chandelier_exit_level(df: pd.DataFrame, atr_mult: float = 2.5, period: int = 22, side: str = "LONG") -> float:
+    atr_ = atr_wilder(df, 14)
+    if side == "LONG":
+        highest = df["high"].rolling(period).max()
+        ch = highest - atr_mult * atr_
+    else:
+        lowest = df["low"].rolling(period).min()
+        ch = lowest + atr_mult * atr_
+    return float(ch.iloc[-1])
+
 def anchored_vwap(df: pd.DataFrame, anchor: Optional[datetime] = None) -> pd.Series:
     if anchor is None:
         last_ts = df["ts"].iloc[-1].to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
         anchor = last_ts.replace(tzinfo=UTC)
     mask = df["ts"] >= pd.Timestamp(anchor, tz=UTC)
-    p = df.loc[mask, "close"]
-    v = df.loc[mask, "volume"]
-    pv = (p * v).cumsum()
-    vv = v.cumsum() + 1e-9
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    pv = (tp[mask] * df.loc[mask, "volume"]).cumsum()
+    vv = df.loc[mask, "volume"].cumsum() + 1e-9
     vw = pv / vv
     out = pd.Series(index=df.index, dtype=float)
     out.loc[mask] = vw
@@ -648,7 +787,7 @@ def resample_ohlcv(df: Optional[pd.DataFrame], freq: str) -> Optional[pd.DataFra
     out.columns = ["open","high","low","close","volume"]
     out = out.dropna().reset_index()
     out["ts"] = pd.to_datetime(out["ts"], utc=True)
-    return out[["ts","open","high","low","close","volume"]]
+    return drop_incomplete(out[["ts","open","high","low","close","volume"]], "1d" if freq.upper()=="1D" else "1w")
 
 @dataclass
 class Signal:
@@ -691,6 +830,7 @@ class Signal:
             watch_until=datetime.fromisoformat(row["watch_until"]),
         )
 
+# ------------------------ News ------------------------
 def compute_term_weight(text: str) -> Tuple[float, float]:
     t = normalize_text(text)
     neg_w = 0.0
@@ -707,11 +847,10 @@ def time_decay_weight(age_hours: float) -> float:
     return float(math.exp(-age_hours / 6.0))
 
 def sentiment_to_boost(neg: float, pos: float) -> float:
-    if neg == 0 and pos == 0:
-        return 0.2
-    ratio = (neg + 1.0) / (pos + 1.0)
-    boost = min(2.0, max(0.0, 0.6 * ratio))
-    return boost
+    # логистическая шкала по балансу нег-поз, ограничение [0..2]
+    x = (neg - pos)
+    z = 2.0 / (1.0 + math.exp(-0.8 * x))  # 0..2
+    return float(min(2.0, max(0.0, z)))
 
 def try_fetch_news_bulk(token: str, currencies: List[str]) -> Tuple[Dict[str, Tuple[float, str]], int]:
     try:
@@ -728,9 +867,15 @@ def try_fetch_news_bulk(token: str, currencies: List[str]) -> Tuple[Dict[str, Tu
         pos: Dict[str, float] = {c: 0.0 for c in currencies}
         items: Dict[str, List[Tuple[float, str, float, str]]] = {c: [] for c in currencies}
         cutoff = now_utc() - timedelta(hours=12)
+        seen_titles: Set[str] = set()
         for p in posts:
             pub = p.get("published_at")
             title = (p.get("title") or "").strip()
+            urlp = (p.get("url") or "").strip()
+            dedup_key = normalize_text(title)[:180] or normalize_text(urlp)[:180]
+            if dedup_key in seen_titles:
+                continue
+            seen_titles.add(dedup_key)
             desc = (p.get("description") or "").strip()
             text = f"{title} {desc}"
             try:
@@ -760,6 +905,8 @@ def try_fetch_news_bulk(token: str, currencies: List[str]) -> Tuple[Dict[str, Tu
             w = time_decay_weight(age_h)
             sign = "NEG" if n_w > p_w else ("POS" if p_w > n_w else "NEU")
             sc = (n_w + p_w) * w
+            # нормировка веса источника — CryptoPanic часто дублирует GoogleNews
+            sc *= 0.9
             for code_c in currs:
                 if code_c not in currencies:
                     continue
@@ -809,6 +956,7 @@ def fetch_news_rss(currencies: List[str]) -> Dict[str, Tuple[float, str]]:
         else:
             q = [code]
         sources.append(google_news_url(q))
+    seen_titles: Set[str] = set()
     for url in sources:
         try:
             feed = feedparser.parse(url)
@@ -818,6 +966,11 @@ def fetch_news_rss(currencies: List[str]) -> Dict[str, Tuple[float, str]]:
                 if dt < cutoff:
                     continue
                 title = (getattr(e, "title", "") or "").strip()
+                link = (getattr(e, "link", "") or "").strip()
+                dedup_key = normalize_text(title)[:180] or normalize_text(link)[:180]
+                if dedup_key in seen_titles:
+                    continue
+                seen_titles.add(dedup_key)
                 summary = (getattr(e, "summary", "") or "").strip()
                 text = f"{title} {summary}".strip()
                 matched = classify_currencies(text)
@@ -983,6 +1136,12 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
     df5["rsi"] = rsi(df5["close"], 14)
     _, _, df5["macdh"] = macd(df5["close"], 12, 26, 9)
     df15["atr"] = atr(df15, 14)
+
+    # Фильтр: не входим сразу после огромной 5m свечи (погоня за импульсом)
+    if big_candle(df5, atr_mult=1.6, atr_period=14) and not relax:
+        logger.info("Фильтр big-candle: пропуск %s", symbol)
+        return None
+
     df5["obv"] = obv(df5)
     df15["bb_low"], df15["bb_mid"], df15["bb_up"] = bollinger(df15["close"], 20, 2.0)
     df15["adx"] = adx(df15, 14)
@@ -1106,6 +1265,55 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
         short_score -= 0.4
     side = "LONG" if long_score >= short_score else "SHORT"
     side_score = float(max(long_score, short_score))
+
+    # ------------------- NEW FILTERS BLOCK (SQUEEZE / MTF / PDH/PDL / CLOUD / ENTRY ANCHOR) -------------------
+    sq_on, sq_bars = is_squeeze(df15, n=20, bb_k=2.0, kc_k=1.5, lookback=20)
+    upper_b = float(df15["bb_up"].iloc[-1]); lower_b = float(df15["bb_low"].iloc[-1])
+    weak_trend = (adx15 < 18 and regime_score < 0.35)
+    if weak_trend and sq_on and not relax:
+        breakout_long = c15 > upper_b
+        breakout_short = c15 < lower_b
+        if side == "LONG" and not breakout_long:
+            logger.info("Фильтр squeeze: нет breakout вверх для %s", symbol)
+            return None
+        if side == "SHORT" and not breakout_short:
+            logger.info("Фильтр squeeze: нет breakout вниз для %s", symbol)
+            return None
+
+    votes_long = int(cond4h_up) + int(cond1h_up) + int(cond15_up)
+    votes_short = 3 - votes_long
+    if not relax:
+        if side == "LONG" and votes_long < 2:
+            logger.info("Фильтр MTF: недостаточно голосов LONG (%d) для %s", votes_long, symbol)
+            return None
+        if side == "SHORT" and votes_short < 2:
+            logger.info("Фильтр MTF: недостаточно голосов SHORT (%d) для %s", votes_short, symbol)
+            return None
+
+    prev_hi, prev_lo = prev_session_levels(df1d)
+    if prev_hi is not None and prev_lo is not None and not relax:
+        dist_hi_atr = abs(prev_hi - c15) / (atr15 + 1e-9)
+        dist_lo_atr = abs(c15 - prev_lo) / (atr15 + 1e-9)
+        if side == "LONG" and prev_hi >= c15 and dist_hi_atr < 0.3:
+            logger.info("Фильтр PDH близко: LONG в сопротивление %s", symbol)
+            return None
+        if side == "SHORT" and prev_lo <= c15 and dist_lo_atr < 0.3:
+            logger.info("Фильтр PDL близко: SHORT в поддержку %s", symbol)
+            return None
+
+    if ich_in_cloud and adx15 < 18 and not relax:
+        logger.info("Фильтр Ichimoku-cloud+ADX: пропуск %s", symbol)
+        return None
+
+    kcm = float(df15["kc_mid"].iloc[-1]); vwap_d = float(df15["vwap_day"].iloc[-1])
+    entry_anchor = 0.5 * (kcm + vwap_d)
+    dist_anchor_atr = abs(c5 - entry_anchor) / (atr15 + 1e-9)
+    if dist_anchor_atr > 1.2 and not relax:
+        logger.info("Фильтр EntryAnchor: далеко от зоны входа %s", symbol)
+        return None
+    # -----------------------------------------------------------------------------------------------------------
+
+    # Стоп по swing/ATR и минимальный риск
     window15 = 20
     swing_low_15 = float(df15["low"].iloc[-window15:].min())
     swing_high_15 = float(df15["high"].iloc[-window15:].max())
@@ -1125,7 +1333,12 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
         else:
             sl = c5 + min_risk_abs
         risk = min_risk_abs
-    tps = _compute_tps_by_atr(c5, side, atr15, regime_score)
+
+    # Тейки с усилением при сильном тренде (ADX)
+    trend_boost = min(1.2, 0.9 + max(0.0, (adx15 - 18.0) / 32.0))
+    tps = _compute_tps_by_atr(c5, side, atr15, regime_score * trend_boost)
+
+    # Корреляции/согласование с BTC/ETH
     btc1h = market.fetch_ohlcv("BTC/USDT", "1h", 200)
     btc15 = market.fetch_ohlcv("BTC/USDT", "15m", 300)
     btc5 = market.fetch_ohlcv("BTC/USDT", "5m", 400)
@@ -1156,10 +1369,20 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
         align_score += 0.4
     else:
         align_score -= 0.2
-    if news_boost >= 1.2:
-        side_score -= 0.4
-    elif news_boost <= 0.4:
-        side_score += 0.2
+
+    # Направленная логика по новостям
+    neg, pos, tops = _parse_news_note(news_note)
+    if side == "LONG":
+        if (neg - pos) > 1.5:
+            side_score -= 0.8
+        elif pos > neg:
+            side_score += 0.2
+    else:
+        if (pos - neg) > 1.5:
+            side_score -= 0.8
+        elif neg > pos:
+            side_score += 0.2
+
     side_score += align_score
 
     def atr_to_risk(a_pct: float) -> int:
@@ -1175,6 +1398,7 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
             return 8
         else:
             return 9
+
     base_risk = atr_to_risk(atr_pct)
     risk_level = int(max(1, min(10, round(base_risk + news_boost))))
     leverage = int(round(50 - (risk_level - 1) * (45 / 9)))
@@ -1182,6 +1406,7 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
     if news_boost > 1.0:
         leverage = min(leverage, 10)
     watch_seconds = _choose_watch_seconds(atr_pct, regime_score)
+
     details = {
         "side": side,
         "score": float(side_score),
@@ -1332,8 +1557,13 @@ async def rank_symbols_async(symbols: List[str]) -> List[Tuple[str, Dict]]:
         logger.warning("Ранжирование: кандидатов нет")
         return []
     candidates.sort(key=lambda x: x[0], reverse=True)
-    top_score = candidates[0][0]
-    near_tops = [c for c in candidates if c[0] >= top_score - 0.6]
+
+    # Ужесточаем отбор: минимум порог по score
+    MIN_SCORE = 1.7
+    pool = [c for c in candidates if c[0] >= MIN_SCORE] or candidates
+    top_score = pool[0][0]
+    near_tops = [c for c in pool if c[0] >= top_score - 0.6]
+
     ordered = []
     picked_bases: Set[str] = set()
     for sc, det in near_tops:
@@ -1545,16 +1775,17 @@ if PROMETHEUS_OK:
 async def update_trailing(sig: Signal):
     try:
         df15 = market.fetch_ohlcv(sig.symbol, "15m", 200)
-        if df15 is None:
+        if df15 is None or len(df15) < 50:
             return
         st_line, st_dir = supertrend(df15, 10, 3.0)
         st_val = float(st_line.iloc[-1])
+        ch_val = chandelier_exit_level(df15, atr_mult=2.5, period=22, side=sig.side)
         if sig.side == "LONG":
-            new_sl = max(sig.sl, st_val)
+            new_sl = max(sig.sl, max(st_val, ch_val))
             if new_sl < sig.tps[0]:
                 sig.sl = new_sl
         else:
-            new_sl = min(sig.sl, st_val)
+            new_sl = min(sig.sl, min(st_val, ch_val))
             if new_sl > sig.tps[0]:
                 sig.sl = new_sl
     except Exception:
@@ -1899,8 +2130,7 @@ class AdminReplyFilter(Filter):
     async def __call__(self, message: Message) -> bool:
         if not message.from_user or not message.text:
             return False
-        # Не перехватываем команды — админ может пользоваться ботом,
-        # а «режим ответа» подождёт первого обычного сообщения
+        
         if message.text.startswith("/"):
             return False
         return message.from_user.id in support_reply_targets
@@ -2244,6 +2474,7 @@ def release_lock():
 
 async def main():
     global db
+    if not DISABLE_LOCK:
     acquire_lock()
     if PROMETHEUS_OK and METRICS_PORT > 0:
         with contextlib.suppress(Exception):
@@ -2259,7 +2490,15 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        release_lock()
+        if not DISABLE_LOCK:
+            release_lock()
+
+try:
+    import main as neon_ta  
+    neon_ta.patch(globals())
+    logger.info("Enhanced TA module loaded.")
+except Exception as _e:
+    logger.exception("Не удалось загрузить улучшения TA: %s", _e)
 
 if __name__ == "__main__":
     try:
