@@ -1509,17 +1509,11 @@ def start_keyboard() -> InlineKeyboardMarkup:
     ])
 
 def main_menu_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    if is_admin:
-        kb = [
-            [KeyboardButton(text="📈 Получить сигнал")],
-            [KeyboardButton(text="ℹ️ Помощь")],
-        ]
-    else:
-        kb = [
-            [KeyboardButton(text="📈 Получить сигнал")],
-            [KeyboardButton(text="ℹ️ Помощь")],
-            [KeyboardButton(text="Поддержка")],
-        ]
+    kb = [
+        [KeyboardButton(text="📈 Получить сигнал")],
+        [KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="Поддержка")],
+    ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 def support_kb() -> ReplyKeyboardMarkup:
@@ -1744,9 +1738,17 @@ async def cmd_start(message: Message, bot: Bot):
 async def on_continue(cb: CallbackQuery, bot: Bot):
     if await is_user_subscribed(bot, cb.from_user.id):
         st = await db.get_user_state(cb.from_user.id)
-        await cb.message.answer("Отлично! Подписка подтверждена. Можете запросить сигнал.", reply_markup=main_menu_kb(st.get("unlimited", False)))
+        is_admin = st.get("unlimited", False)
+        logger.info("UI/Menu: sending main menu after Continue to user_id=%s (is_admin=%s)", cb.from_user.id, is_admin)
+        await cb.message.answer(
+            "Отлично! Подписка подтверждена. Можете запросить сигнал.",
+            reply_markup=main_menu_kb(is_admin)
+        )
     else:
-        await cb.message.answer("Вы ещё не подписаны на канал. Подпишитесь и нажмите «Продолжить».", reply_markup=start_keyboard())
+        await cb.message.answer(
+            "Вы ещё не подписаны на канал. Подпишитесь и нажмите «Продолжить».",
+            reply_markup=start_keyboard()
+        )
     await cb.answer()
 
 @router.message(F.text == "ℹ️ Помощь")
@@ -1770,6 +1772,13 @@ async def cmd_health(message: Message):
             ages.append(int(ts_now - news_cache[b][0]))
     age_txt = f", avg_news_age={sum(ages)//len(ages)}s" if ages else ""
     await message.answer(f"health • news={'OK' if ok_news else 'NO'} • price={'OK' if price_ok else 'NO'}{age_txt}")
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, bot: Bot):
+    st = await db.get_user_state(message.from_user.id)
+    is_admin = st.get("unlimited", False)
+    logger.info("UI/Menu: push main menu to user_id=%s (is_admin=%s)", message.from_user.id, is_admin)
+    await message.answer("Меню обновлено.", reply_markup=main_menu_kb(is_admin))    
 
 async def ensure_user_counter(user_id: int) -> Dict[str, Any]:
     assert db is not None
@@ -1827,21 +1836,25 @@ async def cmd_price(message: Message, command: CommandObject, bot: Bot):
     else:
         await message.answer(f"{base}: {format_price(float(last))}")
 
+
+
 @router.message(F.text == "Поддержка")
-@router.message(Command("sapport"))
 @router.message(Command("support"))
 async def on_support(message: Message, bot: Bot):
     st = await db.get_user_state(message.from_user.id)
     if st.get("support_mode"):
         await message.answer("Вы уже в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
+        logger.info("UI/Support: user_id=%s already in support_mode", message.from_user.id)
         return
     await db.set_support_mode(message.from_user.id, True)
+    logger.info("UI/Support: user_id=%s entered support_mode", message.from_user.id)
     await message.answer("Напишите ваш вопрос", reply_markup=support_kb())
 
 @router.message(F.text == "Назад")
 async def on_support_back_btn(message: Message, bot: Bot):
     st = await db.get_user_state(message.from_user.id)
     await db.set_support_mode(message.from_user.id, False)
+    logger.info("Support: user_id=%s exited support_mode via reply Back", message.from_user.id)
     if not await is_user_subscribed(bot, message.from_user.id):
         await message.answer("Вы вышли из режима поддержки. Для доступа к функциям подпишитесь на канал.", reply_markup=start_keyboard())
         return
@@ -1850,16 +1863,15 @@ async def on_support_back_btn(message: Message, bot: Bot):
 @router.callback_query(F.data == "support_user_back")
 async def cb_support_user_back(cb: CallbackQuery, bot: Bot):
     await db.set_support_mode(cb.from_user.id, False)
+    logger.info("UI/Support: user_id=%s exited support_mode via inline Back", cb.from_user.id)
     st = await db.get_user_state(cb.from_user.id)
 
-    # Если пользователь не подписан — показываем приглашение подписаться
     if not await is_user_subscribed(bot, cb.from_user.id):
         await cb.message.answer(
             "Вы вышли из режима поддержки. Для доступа к функциям подпишитесь на канал.",
             reply_markup=start_keyboard()
         )
     else:
-        # Подписан — возвращаем основное меню
         await cb.message.answer(
             "Вы вернулись к основному функционалу.",
             reply_markup=main_menu_kb(st.get("unlimited", False))
@@ -1906,9 +1918,12 @@ def user_display_name(u: Any) -> str:
 @router.message(UserSupportFilter())
 async def user_support_message(message: Message, bot: Bot):
     txt = message.text.strip()
+    logger.info("Support: question from user_id=%s: %s", message.from_user.id, txt)
     await message.answer("Мы уже увидели ваш вопрос, дожидайтесь ответа", reply_markup=support_kb())
     admin_ids = await db.get_admin_user_ids()
+    logger.info("Support: forwarding to %d admins", len(admin_ids))
     if not admin_ids:
+        logger.warning("Support: no admins available to receive the question")
         return
     u = message.from_user
     disp = user_display_name(u)
@@ -2182,6 +2197,11 @@ async def fallback(message: Message):
 
 async def on_startup(bot: Bot):
     logger.info("Старт бота: проверка новостей...")
+    try:
+        admins = await db.get_admin_user_ids()
+        logger.info("Support: startup — admins_count=%d, handlers_ready=True", len(admins))
+    except Exception as e:
+        logger.warning("Support: startup check failed: %s", e)
     ok = check_news_health()
     if ok:
         logger.info("Новости RSS: OK")
