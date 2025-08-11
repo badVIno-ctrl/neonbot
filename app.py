@@ -1,30 +1,15 @@
 import asyncio
 import logging
 import os
-import asyncio
-import logging
-import os
 import re
 import json
 import math
 import ctypes
 import calendar
 import contextlib
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, UTC
-from typing import Dict, List, Optional, Tuple, Any, Set
-from concurrent.futures import ThreadPoolExecutor
-from time import time
-from urllib.parse import quote_plus
-
 import atexit
-import signal
-import re
-import json
-import math
-import ctypes
-import calendar
-import contextlib
+import errno
+
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from typing import Dict, List, Optional, Tuple, Any, Set
@@ -41,19 +26,23 @@ import aiosqlite
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject, Filter
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
-from dotenv import load_dotenv
-load_dotenv()
-DISABLE_LOCK = os.getenv("DISABLE_LOCK", "0") == "1"
+from html import escape as html_escape
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramNetworkError
+
 try:
-    from prometheus_client import start_http_server, Counter, Gauge
+    from prometheus_client import start_http_server, Counter, Gauge, Summary
     PROMETHEUS_OK = True
 except Exception:
     PROMETHEUS_OK = False
+
+# NEW: aiohttp for session configuration
+import aiohttp
 
 load_dotenv()
 
@@ -62,6 +51,11 @@ CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@NeonFakTrading").strip()
 DB_PATH = os.getenv("DB_PATH", "neon_bot.db").strip()
 LOCK_PATH = os.getenv("LOCK_PATH", "neon_bot.lock").strip()
 METRICS_PORT = int(os.getenv("METRICS_PORT", "0").strip() or "0")
+
+# Дополнительные флаги управления локом
+LOCK_TTL_SEC = int(os.getenv("LOCK_TTL_SEC", "7200").strip() or "7200")  # 2 часа
+LOCK_FORCE = os.getenv("LOCK_FORCE", "").strip() == "1"
+DISABLE_LOCK = os.getenv("DISABLE_LOCK", "").strip() == "1"
 
 ADMIN_ACCESS_CODE = os.getenv("UNLIMITED_CODE", "2604").strip()
 ADMIN_CODE = os.getenv("ADMIN_CODE", "admin2604").strip()
@@ -92,7 +86,7 @@ EXCHANGE_PRIORITY = [x.strip() for x in os.getenv("EXCHANGE_PRIORITY", "binance,
 TZ_NAME = os.getenv("TZ", "Europe/Moscow")
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN в .env")
+    raise RuntimeError("Не задан TELEGRAM_BОТ_TOKEN в .env")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("neon-bot")
@@ -371,12 +365,10 @@ class MarketClient:
                 mq = str(m.get("quote") or "").upper()
                 if mb != base or mq != quote:
                     continue
-                # явные приоритеты: линейный USDT swap > USDT spot > всё остальное
                 t_swap = bool(m.get("swap"))
                 t_spot = bool(m.get("spot"))
                 is_linear = bool(m.get("linear"))
                 is_contract = bool(m.get("contract"))
-                # score
                 score = 0
                 if t_swap and is_linear and mq == "USDT":
                     score += 10
@@ -401,7 +393,6 @@ class MarketClient:
     def _prune_ohlcv_cache(self):
         if len(self.ohlcv_cache) <= self.MAX_OHLCV_CACHE:
             return
-        # удалить самые старые записи
         items = sorted(self.ohlcv_cache.items(), key=lambda kv: kv[1][0])
         to_del = len(self.ohlcv_cache) - self.MAX_OHLCV_CACHE
         for k, _ in items[:to_del]:
@@ -415,14 +406,22 @@ class MarketClient:
             cache_key = (name, resolved, timeframe)
             cached = self.ohlcv_cache.get(cache_key)
             if cached and ts - cached[0] < self.OHLCV_TTL:
-                if PROMETHEUS_OK: MET_OHLCV_CACHE_HIT.inc()
+                if PROMETHEUS_OK:
+                    try:
+                        MET_OHLCV_CACHE_HIT.inc()
+                    except Exception:
+                        pass
                 return cached[1].copy()
             if resolved not in ex.markets:
                 continue
             try:
                 t0 = time()
                 data = ex.fetch_ohlcv(resolved, timeframe=timeframe, limit=limit)
-                if PROMETHEUS_OK: MET_OHLCV_LATENCY.observe(time() - t0)
+                if PROMETHEUS_OK:
+                    try:
+                        MET_OHLCV_LATENCY.observe(time() - t0)
+                    except Exception:
+                        pass
                 if not data:
                     continue
                 df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "volume"])
@@ -477,7 +476,11 @@ class MarketClient:
             try:
                 t0 = time()
                 t = ex.fetch_ticker(resolved)
-                if PROMETHEUS_OK: MET_TICKER_LATENCY.observe(time() - t0)
+                if PROMETHEUS_OK:
+                    try:
+                        MET_TICKER_LATENCY.observe(time() - t0)
+                    except Exception:
+                        pass
                 if not isinstance(t, dict):
                     continue
                 out = {
@@ -499,7 +502,6 @@ class MarketClient:
         return None
 
     def get_market_info(self, symbol: str) -> Optional[Dict[str, Any]]:
-        # вернуть информацию по первому доступному маркету
         for _, ex in self._available_exchanges():
             resolved = self.resolve_symbol(ex, symbol) or symbol
             if resolved in ex.markets:
@@ -510,11 +512,9 @@ class MarketClient:
         info = self.get_market_info(symbol)
         if not info:
             return None
-        # ccxt различные биржи: 'precision' -> 'price', 'limits'->'price'->'min', 'tickSize' может быть в 'info'
         tick = None
         prec = info.get("precision", {})
         if isinstance(prec, dict) and "price" in prec and isinstance(prec["price"], (int, float)):
-            # precision как число знаков, не шаг
             p = prec["price"]
             if p is not None and p >= 0 and p <= 10:
                 tick = 10 ** (-p)
@@ -524,7 +524,6 @@ class MarketClient:
                 step = limits.get("step") or limits.get("min")
                 if step:
                     tick = float(step)
-        # некоторые биржи кладут в info
         if not tick:
             inf = info.get("info", {})
             for k in ("tickSize", "minPrice"):
@@ -601,6 +600,10 @@ def adx_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
     adx_ = rma(dx, period)
     return adx_
 
+rsi = rsi_wilder
+atr = atr_wilder
+adx = adx_wilder
+
 def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Tuple[pd.Series, pd.Series]:
     hl2 = (df["high"] + df["low"]) / 2.0
     atr_ = atr_wilder(df, period)
@@ -644,7 +647,6 @@ def is_squeeze(df: pd.DataFrame, n: int = 20, bb_k: float = 2.0, kc_k: float = 1
     lb, mb, ub = bollinger(df["close"], n, bb_k)
     inside = (ub < ku) & (lb > kl)
     cnt = int(inside.tail(lookback).sum())
-    # объём при выходе (последняя свеча) выше медианы * мультипликатор — подтверждение
     vol_med = float(df["volume"].tail(lookback).median() + 1e-9)
     vol_ok = float(df["volume"].iloc[-1]) >= SQUEEZE_VOL_MULT * vol_med
     return (cnt >= max(4, lookback // 3) and vol_ok, cnt)
@@ -831,6 +833,8 @@ class Signal:
         )
 
 # ------------------------ News ------------------------
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 NeonBot/1.0"
+
 def compute_term_weight(text: str) -> Tuple[float, float]:
     t = normalize_text(text)
     neg_w = 0.0
@@ -847,7 +851,6 @@ def time_decay_weight(age_hours: float) -> float:
     return float(math.exp(-age_hours / 6.0))
 
 def sentiment_to_boost(neg: float, pos: float) -> float:
-    # логистическая шкала по балансу нег-поз, ограничение [0..2]
     x = (neg - pos)
     z = 2.0 / (1.0 + math.exp(-0.8 * x))  # 0..2
     return float(min(2.0, max(0.0, z)))
@@ -857,7 +860,7 @@ def try_fetch_news_bulk(token: str, currencies: List[str]) -> Tuple[Dict[str, Tu
         cur_param = ",".join(currencies)
         url = f"https://cryptopanic.com/api/v1/posts/?auth_token={token}&currencies={cur_param}&public=true"
         logger.info("Новости: запрос к CryptoPanic для %d валют", len(currencies))
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=15, headers={"User-Agent": UA})
         code = r.status_code
         if code != 200:
             return {}, code
@@ -905,7 +908,6 @@ def try_fetch_news_bulk(token: str, currencies: List[str]) -> Tuple[Dict[str, Tu
             w = time_decay_weight(age_h)
             sign = "NEG" if n_w > p_w else ("POS" if p_w > n_w else "NEU")
             sc = (n_w + p_w) * w
-            # нормировка веса источника — CryptoPanic часто дублирует GoogleNews
             sc *= 0.9
             for code_c in currs:
                 if code_c not in currencies:
@@ -959,7 +961,7 @@ def fetch_news_rss(currencies: List[str]) -> Dict[str, Tuple[float, str]]:
     seen_titles: Set[str] = set()
     for url in sources:
         try:
-            feed = feedparser.parse(url)
+            feed = feedparser.parse(url, request_headers={"User-Agent": UA})
             entries = feed.entries[:80]
             for e in entries:
                 dt = entry_time_utc(e)
@@ -1053,7 +1055,10 @@ async def news_updater():
                 for cur, pair in mapping.items():
                     news_cache[cur] = (ts, pair)
                 if PROMETHEUS_OK:
-                    MET_NEWS_UPDATES.inc()
+                    try:
+                        MET_NEWS_UPDATES.inc()
+                    except Exception:
+                        pass
                 logger.info("Новости: кэш обновлён.")
             else:
                 logger.warning("Новости: не удалось обновить (использую кэш).")
@@ -1266,7 +1271,7 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
     side = "LONG" if long_score >= short_score else "SHORT"
     side_score = float(max(long_score, short_score))
 
-    # ------------------- NEW FILTERS BLOCK (SQUEEZE / MTF / PDH/PDL / CLOUD / ENTRY ANCHOR) -------------------
+    # NEW FILTERS BLOCK (as was)
     sq_on, sq_bars = is_squeeze(df15, n=20, bb_k=2.0, kc_k=1.5, lookback=20)
     upper_b = float(df15["bb_up"].iloc[-1]); lower_b = float(df15["bb_low"].iloc[-1])
     weak_trend = (adx15 < 18 and regime_score < 0.35)
@@ -1311,9 +1316,7 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
     if dist_anchor_atr > 1.2 and not relax:
         logger.info("Фильтр EntryAnchor: далеко от зоны входа %s", symbol)
         return None
-    # -----------------------------------------------------------------------------------------------------------
 
-    # Стоп по swing/ATR и минимальный риск
     window15 = 20
     swing_low_15 = float(df15["low"].iloc[-window15:].min())
     swing_high_15 = float(df15["high"].iloc[-window15:].max())
@@ -1334,11 +1337,9 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
             sl = c5 + min_risk_abs
         risk = min_risk_abs
 
-    # Тейки с усилением при сильном тренде (ADX)
     trend_boost = min(1.2, 0.9 + max(0.0, (adx15 - 18.0) / 32.0))
     tps = _compute_tps_by_atr(c5, side, atr15, regime_score * trend_boost)
 
-    # Корреляции/согласование с BTC/ETH
     btc1h = market.fetch_ohlcv("BTC/USDT", "1h", 200)
     btc15 = market.fetch_ohlcv("BTC/USDT", "15m", 300)
     btc5 = market.fetch_ohlcv("BTC/USDT", "5m", 400)
@@ -1370,7 +1371,6 @@ def score_symbol_core(symbol: str, relax: bool = False) -> Optional[Tuple[float,
     else:
         align_score -= 0.2
 
-    # Направленная логика по новостям
     neg, pos, tops = _parse_news_note(news_note)
     if side == "LONG":
         if (neg - pos) > 1.5:
@@ -1558,7 +1558,6 @@ async def rank_symbols_async(symbols: List[str]) -> List[Tuple[str, Dict]]:
         return []
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    # Ужесточаем отбор: минимум порог по score
     MIN_SCORE = 1.7
     pool = [c for c in candidates if c[0] >= MIN_SCORE] or candidates
     top_score = pool[0][0]
@@ -1670,19 +1669,19 @@ def build_reason(details: Dict) -> str:
         setup.append("BOS↑" + ("+retest" if bos_retest else ""))
     elif bos_dir == -1:
         setup.append("BOS↓" + ("+retest" if bos_retest else ""))
-    if don_l and side == "LONG":
+    if don_l and details.get("side") == "LONG":
         setup.append("Donchian↑")
-    if don_s and side == "SHORT":
+    if don_s and details.get("side") == "SHORT":
         setup.append("Donchian↓")
     if vwap_conf:
         setup.append("у VWAP")
     risk_mgmt = []
     risk_mgmt.append(f"ATR(15m)≈{atr:.4f} ({atr_pct:.2f}%)")
-    risk_mgmt.append(f"SL {format_price(sl)} ({((entry-sl)/entry*100 if side=='LONG' else (sl-entry)/entry*100):.2f}% от входа)")
+    risk_mgmt.append(f"SL {format_price(sl)} ({((entry-sl)/entry*100 if details.get('side')=='LONG' else (sl-entry)/entry*100):.2f}% от входа)")
     if tps:
-        d1 = (tps[0]-entry)/entry*100 if side=="LONG" else (entry-tps[0])/entry*100
-        d2 = (tps[1]-entry)/entry*100 if side=="LONG" else (entry-tps[1])/entry*100
-        d3 = (tps[2]-entry)/entry*100 if side=="LONG" else (entry-tps[2])/entry*100
+        d1 = (tps[0]-entry)/entry*100 if details.get("side")=="LONG" else (entry-tps[0])/entry*100
+        d2 = (tps[1]-entry)/entry*100 if details.get("side")=="LONG" else (entry-tps[1])/entry*100
+        d3 = (tps[2]-entry)/entry*100 if details.get("side")=="LONG" else (entry-tps[2])/entry*100
         risk_mgmt.append(f"TP1 {d1:.2f}%, TP2 {d2:.2f}%, TP3 {d3:.2f}% (по ATR, ближние)")
     meta = []
     if vol_z is not None:
@@ -1722,6 +1721,25 @@ def format_signal_message(sig: Signal) -> str:
     if line7:
         parts.append(line7)
     return "\n".join(parts) + disclaimer
+
+# ---------- SAFE TG SEND HELPERS (retries for network hiccups) ----------
+async def send_retry_html(bot: Bot, chat_id: int, text: str, reply_markup=None, tries: int = 3):
+    for i in range(tries):
+        try:
+            return await bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        except TelegramNetworkError as e:
+            if i == tries - 1:
+                raise
+            await asyncio.sleep(0.6 * (2 ** i))
+
+async def edit_retry_html(message_obj: Message, text: str, tries: int = 3):
+    for i in range(tries):
+        try:
+            return await message_obj.edit_text(text, parse_mode=ParseMode.HTML)
+        except TelegramNetworkError:
+            if i == tries - 1:
+                raise
+            await asyncio.sleep(0.6 * (2 ** i))
 
 async def is_user_subscribed(bot: Bot, user_id: int) -> bool:
     try:
@@ -1849,6 +1867,31 @@ def _tech_risk_trigger(symbol: str, side: str) -> Optional[str]:
 async def watch_signal_price(bot: Bot, chat_id: int, sig: Signal):
     last_trail_update = 0.0
     last_risk_check = 0.0
+
+    async def notify(text: str) -> str:
+        for attempt in range(3):
+            try:
+                await bot.send_message(chat_id, text)
+                return "ok"
+            except TelegramNetworkError as e:
+                if attempt == 2:
+                    logger.warning("Send message network error (final): %s", e)
+                    return "network_error"
+                await asyncio.sleep(0.6 * (2 ** attempt))
+            except TelegramForbiddenError as e:
+                logger.warning("Send message forbidden (user blocked bot) chat_id=%s: %s", chat_id, e)
+                sig.active = False
+                with contextlib.suppress(Exception):
+                    if db:
+                        await db.update_signal(sig)
+                return "forbidden"
+            except TelegramBadRequest as e:
+                logger.warning("Send message bad request chat_id=%s: %s", chat_id, e)
+                return "bad_request"
+            except Exception as e:
+                logger.warning("Send message error chat_id=%s: %s", chat_id, e)
+                return "error"
+
     try:
         logger.info("Мониторинг: старт %s %s (до %s)", sig.symbol, sig.side, sig.watch_until.isoformat())
         while now_msk() < sig.watch_until and sig.active:
@@ -1861,10 +1904,14 @@ async def watch_signal_price(bot: Bot, chat_id: int, sig: Signal):
                 last_risk_check = now_ts
                 news_msg = _news_risk_trigger(sig.side, sig.news_note)
                 if news_msg and _should_alert(sig.id or -1, "news"):
-                    await bot.send_message(chat_id, f"⚠️ Риск-алерт по {sig.symbol.split('/')[0]}: {news_msg}\nРекомендация: сократить/закрыть позицию.")
+                    res = await notify(f"⚠️ Риск-алерт по {sig.symbol.split('/')[0]}: {news_msg}\nРекомендация: сократить/закрыть позицию.")
+                    if res == "forbidden":
+                        break
                 tech_msg = _tech_risk_trigger(sig.symbol, sig.side)
                 if tech_msg and _should_alert(sig.id or -1, "tech"):
-                    await bot.send_message(chat_id, f"⚠️ Риск-алерт по {sig.symbol.split('/')[0]}: {tech_msg}\nРекомендация: сократить/закрыть позицию.")
+                    res = await notify(f"⚠️ Риск-алерт по {sig.symbol.split('/')[0]}: {tech_msg}\nРекомендация: сократить/закрыть позицию.")
+                    if res == "forbidden":
+                        break
             if sig.tp_hit >= 1 and sig.trailing and now_ts - last_trail_update > 60:
                 await update_trailing(sig)
                 last_trail_update = now_ts
@@ -1877,20 +1924,24 @@ async def watch_signal_price(bot: Bot, chat_id: int, sig: Signal):
                     sig.trail_mode = "supertrend"
                     if PROMETHEUS_OK: MET_TP1.inc()
                     logger.info("Мониторинг: TP1 %s", sig.symbol)
-                    await bot.send_message(chat_id, f"✅ TP1 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Стоп в БУ ({format_price(sig.sl)}), включён трейлинг.")
+                    res = await notify(f"✅ TP1 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Стоп в БУ ({format_price(sig.sl)}), включён трейлинг.")
+                    if res == "forbidden":
+                        break
                     if db: await db.update_signal(sig)
                 if sig.tp_hit < 2 and price >= sig.tps[1]:
                     sig.tp_hit = 2
                     if PROMETHEUS_OK: MET_TP2.inc()
                     logger.info("Мониторинг: TP2 %s", sig.symbol)
-                    await bot.send_message(chat_id, f"✅ TP2 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                    res = await notify(f"✅ TP2 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                    if res == "forbidden":
+                        break
                     if db: await db.update_signal(sig)
                 if sig.tp_hit < 3 and price >= sig.tps[2]:
                     sig.tp_hit = 3
                     sig.active = False
                     if PROMETHEUS_OK: MET_TP3.inc()
                     logger.info("Мониторинг: TP3 %s", sig.symbol)
-                    await bot.send_message(chat_id, f"🎯 TP3 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Сигнал завершён.")
+                    res = await notify(f"🎯 TP3 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Сигнал завершён.")
                     if db: await db.update_signal(sig)
                     break
                 if price <= sig.sl:
@@ -1898,11 +1949,15 @@ async def watch_signal_price(bot: Bot, chat_id: int, sig: Signal):
                     if sig.tp_hit >= 1 and sig.sl >= sig.entry:
                         if PROMETHEUS_OK: MET_BE.inc()
                         logger.info("Мониторинг: BE %s", sig.symbol)
-                        await bot.send_message(chat_id, f"🟨 Позиция по {sig.symbol.split('/')[0]} закрыта по безубытку (BE).")
+                        res = await notify(f"🟨 Позиция по {sig.symbol.split('/')[0]} закрыта по безубытку (BE).")
+                        if res == "forbidden":
+                            break
                     else:
                         if PROMETHEUS_OK: MET_STOP.inc()
                         logger.info("Мониторинг: STOP %s", sig.symbol)
-                        await bot.send_message(chat_id, f"🛑 Стоп сработал по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                        res = await notify(f"🛑 Стоп сработал по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                        if res == "forbidden":
+                            break
                     if db: await db.update_signal(sig)
                     break
             else:
@@ -1913,20 +1968,24 @@ async def watch_signal_price(bot: Bot, chat_id: int, sig: Signal):
                     sig.trail_mode = "supertrend"
                     if PROMETHEUS_OK: MET_TP1.inc()
                     logger.info("Мониторинг: TP1 %s", sig.symbol)
-                    await bot.send_message(chat_id, f"✅ TP1 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Стоп в БУ ({format_price(sig.sl)}), включён трейлинг.")
+                    res = await notify(f"✅ TP1 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Стоп в БУ ({format_price(sig.sl)}), включён трейлинг.")
+                    if res == "forbidden":
+                        break
                     if db: await db.update_signal(sig)
                 if sig.tp_hit < 2 and price <= sig.tps[1]:
                     sig.tp_hit = 2
                     if PROMETHEUS_OK: MET_TP2.inc()
                     logger.info("Мониторинг: TP2 %s", sig.symbol)
-                    await bot.send_message(chat_id, f"✅ TP2 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                    res = await notify(f"✅ TP2 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                    if res == "forbidden":
+                        break
                     if db: await db.update_signal(sig)
                 if sig.tp_hit < 3 and price <= sig.tps[2]:
                     sig.tp_hit = 3
                     sig.active = False
                     if PROMETHEUS_OK: MET_TP3.inc()
                     logger.info("Мониторинг: TP3 %s", sig.symbol)
-                    await bot.send_message(chat_id, f"🎯 TP3 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Сигнал завершён.")
+                    res = await notify(f"🎯 TP3 достигнут по {sig.symbol.split('/')[0]} (цена {format_price(price)}). Сигнал завершён.")
                     if db: await db.update_signal(sig)
                     break
                 if price >= sig.sl:
@@ -1934,34 +1993,41 @@ async def watch_signal_price(bot: Bot, chat_id: int, sig: Signal):
                     if sig.tp_hit >= 1 and sig.sl <= sig.entry:
                         if PROMETHEUS_OK: MET_BE.inc()
                         logger.info("Мониторинг: BE %s", sig.symbol)
-                        await bot.send_message(chat_id, f"🟨 Позиция по {sig.symbol.split('/')[0]} закрыта по безубытку (BE).")
+                        res = await notify(f"🟨 Позиция по {sig.symbol.split('/')[0]} закрыта по безубытку (BE).")
+                        if res == "forbidden":
+                            break
                     else:
                         if PROMETHEUS_OK: MET_STOP.inc()
                         logger.info("Мониторинг: STOP %s", sig.symbol)
-                        await bot.send_message(chat_id, f"🛑 Стоп сработал по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                        res = await notify(f"🛑 Стоп сработал по {sig.symbol.split('/')[0]} (цена {format_price(price)}).")
+                        if res == "forbidden":
+                            break
                     if db: await db.update_signal(sig)
                     break
             await asyncio.sleep(10)
         if now_msk() >= sig.watch_until and sig.active:
             sig.active = False
             logger.info("Мониторинг: завершён по времени %s", sig.symbol)
-            await bot.send_message(chat_id, f"⏱ Мониторинг сигнала по {sig.symbol.split('/')[0]} завершён по времени.")
+            with contextlib.suppress(TelegramForbiddenError, TelegramBadRequest, Exception):
+                await send_retry_html(bot, chat_id, f"⏱ Мониторинг сигнала по {sig.symbol.split('/')[0]} завершён по времени.")
             if db: await db.update_signal(sig)
     except Exception:
         if PROMETHEUS_OK: MET_WATCH_ERR.inc()
         logger.exception("Мониторинг: ошибка")
         with contextlib.suppress(Exception):
-            await bot.send_message(chat_id, "⚠️ Ошибка мониторинга сигнала.")
+            await send_retry_html(bot, chat_id, "⚠️ Ошибка мониторинга сигнала.")
     finally:
         tasks = active_watch_tasks.get(sig.user_id, [])
         active_watch_tasks[sig.user_id] = [t for t in tasks if not t.done()]
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot):
-    await message.answer(
+    await send_retry_html(
+        bot,
+        message.chat.id,
         "Привет! Чтобы продолжить, подпишитесь на наш канал:\n"
         f"{'https://t.me/' + CHANNEL_USERNAME.lstrip('@')}\n\n"
-        "После подписки нажмите «Продолжить».",
+        "После подписки нажмите «Продолжить».\n\nПоддержка доступна без подписки: используйте команду /support",
         reply_markup=start_keyboard(),
     )
 
@@ -1971,13 +2037,17 @@ async def on_continue(cb: CallbackQuery, bot: Bot):
         st = await db.get_user_state(cb.from_user.id)
         is_admin = st.get("unlimited", False)
         logger.info("UI/Menu: sending main menu after Continue to user_id=%s (is_admin=%s)", cb.from_user.id, is_admin)
-        await cb.message.answer(
+        await send_retry_html(
+            bot,
+            cb.message.chat.id,
             "Отлично! Подписка подтверждена. Можете запросить сигнал.",
             reply_markup=main_menu_kb(is_admin)
         )
     else:
-        await cb.message.answer(
-            "Вы ещё не подписаны на канал. Подпишитесь и нажмите «Продолжить».",
+        await send_retry_html(
+            bot,
+            cb.message.chat.id,
+            "Вы ещё не подписаны на канал. Подпишитесь и нажмите «Продолжить». Или напишите в поддержку: /support",
             reply_markup=start_keyboard()
         )
     await cb.answer()
@@ -2029,13 +2099,17 @@ def resolve_symbol_from_query(q: str) -> Optional[str]:
 
 async def guard_access(message: Message, bot: Bot) -> Optional[Dict[str, Any]]:
     user_id = message.from_user.id
-    if not await is_user_subscribed(bot, user_id):
-        await message.answer("Подпишитесь на канал, чтобы пользоваться ботом:", reply_markup=start_keyboard())
-        return None
     st = await db.get_user_state(user_id)
+
+    # NEW: доступ к поддержке без подписки, но основные функции — только для подписчиков и не в режиме поддержки
     if st.get("support_mode"):
-        await message.answer("Вы в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
+        await send_retry_html(bot, message.chat.id, "Вы в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
         return None
+
+    if not await is_user_subscribed(bot, user_id):
+        await send_retry_html(bot, message.chat.id, "Подпишитесь на канал, чтобы пользоваться функциями бота. Поддержка доступна без подписки: /support", reply_markup=start_keyboard())
+        return None
+
     return st
 
 @router.message(Command("price"))
@@ -2067,19 +2141,17 @@ async def cmd_price(message: Message, command: CommandObject, bot: Bot):
     else:
         await message.answer(f"{base}: {format_price(float(last))}")
 
-
-
 @router.message(F.text == "Поддержка")
 @router.message(Command("support"))
 async def on_support(message: Message, bot: Bot):
     st = await db.get_user_state(message.from_user.id)
     if st.get("support_mode"):
-        await message.answer("Вы уже в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
+        await send_retry_html(bot, message.chat.id, "Вы уже в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
         logger.info("UI/Support: user_id=%s already in support_mode", message.from_user.id)
         return
     await db.set_support_mode(message.from_user.id, True)
     logger.info("UI/Support: user_id=%s entered support_mode", message.from_user.id)
-    await message.answer("Напишите ваш вопрос", reply_markup=support_kb())
+    await send_retry_html(bot, message.chat.id, "Напишите ваш вопрос", reply_markup=support_kb())
 
 @router.message(F.text == "Назад")
 async def on_support_back_btn(message: Message, bot: Bot):
@@ -2087,9 +2159,9 @@ async def on_support_back_btn(message: Message, bot: Bot):
     await db.set_support_mode(message.from_user.id, False)
     logger.info("Support: user_id=%s exited support_mode via reply Back", message.from_user.id)
     if not await is_user_subscribed(bot, message.from_user.id):
-        await message.answer("Вы вышли из режима поддержки. Для доступа к функциям подпишитесь на канал.", reply_markup=start_keyboard())
+        await send_retry_html(bot, message.chat.id, "Вы вышли из режима поддержки. Для доступа к функциям подпишитесь на канал.", reply_markup=start_keyboard())
         return
-    await message.answer("Вы вернулись к основному функционалу.", reply_markup=main_menu_kb(st.get("unlimited", False)))
+    await send_retry_html(bot, message.chat.id, "Вы вернулись к основному функционалу.", reply_markup=main_menu_kb(st.get("unlimited", False)))
 
 @router.callback_query(F.data == "support_user_back")
 async def cb_support_user_back(cb: CallbackQuery, bot: Bot):
@@ -2098,21 +2170,15 @@ async def cb_support_user_back(cb: CallbackQuery, bot: Bot):
     st = await db.get_user_state(cb.from_user.id)
 
     if not await is_user_subscribed(bot, cb.from_user.id):
-        await cb.message.answer(
-            "Вы вышли из режима поддержки. Для доступа к функциям подпишитесь на канал.",
-            reply_markup=start_keyboard()
-        )
+        await send_retry_html(bot, cb.message.chat.id, "Вы вышли из режима поддержки. Для доступа к функциям подпишитесь на канал.", reply_markup=start_keyboard())
     else:
-        await cb.message.answer(
-            "Вы вернулись к основному функционалу.",
-            reply_markup=main_menu_kb(st.get("unlimited", False))
-        )
+        await send_retry_html(bot, cb.message.chat.id, "Вы вернулись к основному функционалу.", reply_markup=main_menu_kb(st.get("unlimited", False)))
     await cb.answer("Режим поддержки отключён")
 
 @router.callback_query(F.data == "support_user_reply")
-async def cb_support_user_reply(cb: CallbackQuery):
+async def cb_support_user_reply(cb: CallbackQuery, bot: Bot):
     await db.set_support_mode(cb.from_user.id, True)
-    await cb.message.answer("Напишите ваш вопрос", reply_markup=support_kb())
+    await send_retry_html(bot, cb.message.chat.id, "Напишите ваш вопрос", reply_markup=support_kb())
     await cb.answer("Режим поддержки включён")
 
 class UserSupportFilter(Filter):
@@ -2130,7 +2196,6 @@ class AdminReplyFilter(Filter):
     async def __call__(self, message: Message) -> bool:
         if not message.from_user or not message.text:
             return False
-        
         if message.text.startswith("/"):
             return False
         return message.from_user.id in support_reply_targets
@@ -2149,7 +2214,7 @@ def user_display_name(u: Any) -> str:
 async def user_support_message(message: Message, bot: Bot):
     txt = message.text.strip()
     logger.info("Support: question from user_id=%s: %s", message.from_user.id, txt)
-    await message.answer("Мы уже увидели ваш вопрос, дожидайтесь ответа", reply_markup=support_kb())
+    await send_retry_html(bot, message.chat.id, "Мы уже увидели ваш вопрос, дожидайтесь ответа", reply_markup=support_kb())
     admin_ids = await db.get_admin_user_ids()
     logger.info("Support: forwarding to %d admins", len(admin_ids))
     if not admin_ids:
@@ -2159,7 +2224,7 @@ async def user_support_message(message: Message, bot: Bot):
     disp = user_display_name(u)
     for aid in admin_ids:
         with contextlib.suppress(Exception):
-            await bot.send_message(aid, f"Вопрос от {disp} (id {u.id}):\n\n{txt}", reply_markup=admin_answer_kb(u.id))
+            await send_retry_html(bot, aid, f"Вопрос от {disp} (id {u.id}):\n\n{txt}", reply_markup=admin_answer_kb(u.id))
 
 @router.callback_query(F.data.startswith("answer_user:"))
 async def cb_admin_answer(cb: CallbackQuery, bot: Bot):
@@ -2173,7 +2238,7 @@ async def cb_admin_answer(cb: CallbackQuery, bot: Bot):
         target_chat = await bot.get_chat(target_id)
     name = user_display_name(target_chat)
     support_reply_targets[cb.from_user.id] = target_id
-    await cb.message.answer(f"Введите ваш ответ пользователю {name}.")
+    await send_retry_html(bot, cb.message.chat.id, f"Введите ваш ответ пользователю {name}.")
     await cb.answer()
 
 @router.message(AdminReplyFilter())
@@ -2184,9 +2249,10 @@ async def admin_send_answer(message: Message, bot: Bot):
         return
     txt = message.text.strip()
     with contextlib.suppress(Exception):
-        await bot.send_message(target_id, f"Сообщение от админа:\n\n{txt}", reply_markup=user_reply_inline_kb())
+        await send_retry_html(bot, target_id, f"Сообщение от админа:\n\n{txt}", reply_markup=user_reply_inline_kb())
     with contextlib.suppress(Exception):
-        await message.answer("Сообщение отправлено")
+        await send_retry_html(bot, message.chat.id, "Сообщение отправлено")
+    # сбрасываем привязку после одного ответа (как просили)
     support_reply_targets.pop(admin_id, None)
 
 @router.message(F.text == "📈 Получить сигнал")
@@ -2206,7 +2272,7 @@ async def cmd_signal(message: Message, bot: Bot):
         ranked = await rank_symbols_async(SYMBOLS)
         if not ranked:
             logger.warning("Поиск пары: кандидатов нет")
-            await working_msg.edit_text("Не удалось найти подходящий сигнал. Попробуйте позже.")
+            await edit_retry_html(working_msg, "Не удалось найти подходящий сигнал. Попробуйте позже.")
             return
         logger.info("Поиск пары: найдено кандидатов %d", len(ranked))
         existing = await db.get_active_signals_for_user(user_id)
@@ -2249,15 +2315,15 @@ async def cmd_signal(message: Message, bot: Bot):
         if sig.side == "LONG":
             if not (all(tp > sig.entry for tp in sig.tps) and sig.sl < sig.entry):
                 logger.warning("Валидация не пройдена для %s LONG", symbol)
-                await working_msg.edit_text("Сигнал не прошёл валидацию. Попробуйте ещё раз.")
+                await edit_retry_html(working_msg, "Сигнал не прошёл валидацию. Попробуйте ещё раз.")
                 return
         else:
             if not (all(tp < sig.entry for tp in sig.tps) and sig.sl > sig.entry):
                 logger.warning("Валидация не пройдена для %s SHORT", symbol)
-                await working_msg.edit_text("Сигнал не прошёл валидацию. Попробуйте ещё раз.")
+                await edit_retry_html(working_msg, "Сигнал не прошёл валидацию. Попробуйте ещё раз.")
                 return
         text = format_signal_message(sig)
-        await working_msg.edit_text(text, parse_mode=ParseMode.HTML)
+        await edit_retry_html(working_msg, text)
         st["count"] = st.get("count", 0) + 1
         await db.save_user_state(user_id, st)
         sig.id = await db.add_signal(sig)
@@ -2269,7 +2335,7 @@ async def cmd_signal(message: Message, bot: Bot):
         if PROMETHEUS_OK: MET_SIGNAL_ERR.inc()
         logger.exception("Ошибка генерации сигнала: %s", e)
         with contextlib.suppress(Exception):
-            await working_msg.edit_text("⚠️ Произошла ошибка при поиске сигнала.")
+            await edit_retry_html(working_msg, "⚠️ Произошла ошибка при поиске сигнала.")
 
 @router.message(Command("status"))
 async def cmd_status(message: Message, bot: Bot):
@@ -2278,28 +2344,29 @@ async def cmd_status(message: Message, bot: Bot):
         return
     sigs = await db.get_active_signals_for_user(message.from_user.id)
     if not sigs:
-        await message.answer("Активных сигналов нет.")
+        await send_retry_html(bot, message.chat.id, "Активных сигналов нет.")
         return
     lines = []
     for s in sigs:
         left = human_td(s.watch_until - now_msk())
         base = s.symbol.split("/")[0]
         lines.append(f"{base} {s.side} • TBX {format_price(s.entry)} • SL {format_price(s.sl)} • TP {s.tp_hit}/3 • осталось {left}")
-    await message.answer("Активные сигналы:\n" + "\n".join(lines))
+    await send_retry_html(bot, message.chat.id, "Активные сигналы:\n" + "\n".join(lines))
 
 @router.message(Command("code"))
 async def cmd_code(message: Message, command: CommandObject, bot: Bot):
     code = (command.args or "").strip()
     if not code:
-        await message.answer("Введите код: /code 2604")
+        await send_retry_html(bot, message.chat.id, "Введите код: /code 2604")
         return
     st = await ensure_user_counter(message.from_user.id)
     if code == ADMIN_ACCESS_CODE:
         st["unlimited"] = True
+        st["admin"] = True  # делаем пользователя админом, чтобы получать вопросы поддержки
         await db.save_user_state(message.from_user.id, st)
-        await message.answer("✅ Код принят. Ограничения по количеству сигналов сняты.", reply_markup=main_menu_kb(True))
+        await send_retry_html(bot, message.chat.id, "✅ Код принят. Ограничения по количеству сигналов сняты. Админ-режим включён.", reply_markup=main_menu_kb(True))
     else:
-        await message.answer("❌ Неверный код.")
+        await send_retry_html(bot, message.chat.id, "❌ Неверный код.")
 
 async def backtest_pair(df15: pd.DataFrame) -> Tuple[int, int, int, int]:
     df = df15.copy()
@@ -2390,7 +2457,7 @@ async def cmd_backtest(message: Message, command: CommandObject, bot: Bot):
                         pairs = [p if "/" in p else f"{p}/USDT" for p in pp]
     except Exception:
         pass
-    await message.answer(f"Запускаю бэктест: {days}д, пары: {', '.join(pairs)}")
+    await send_retry_html(bot, message.chat.id, f"Запускаю бэктест: {days}д, пары: {', '.join(pairs)}")
     total = 0
     tp1 = tp2 = tp3 = stops = 0
     for sym in pairs:
@@ -2409,21 +2476,21 @@ async def cmd_backtest(message: Message, command: CommandObject, bot: Bot):
     rate2 = f"{(tp2/total*100):.1f}%" if total else "n/a"
     rate3 = f"{(tp3/total*100):.1f}%" if total else "n/a"
     stpr = f"{(stops/total*100):.1f}%" if total else "n/a"
-    await message.answer(f"BT итоги • сделки={total} • TP1={tp1} ({rate1}) • TP2={tp2} ({rate2}) • TP3={tp3} ({rate3}) • Stops={stops} ({stpr})")
+    await send_retry_html(bot, message.chat.id, f"BT итоги • сделки={total} • TP1={tp1} ({rate1}) • TP2={tp2} ({rate2}) • TP3={tp3} ({rate3}) • Stops={stops} ({stpr})")
 
 @router.message()
-async def fallback(message: Message):
+async def fallback(message: Message, bot: Bot):
     text = (message.text or "").strip().lower()
     if text in {"помощь", "help"}:
         await cmd_help(message)
     elif text in {"получить сигнал", "сигнал"}:
-        await cmd_signal(message, message.bot)
+        await cmd_signal(message, bot)
     else:
         st = await db.get_user_state(message.from_user.id)
         if st.get("support_mode"):
-            await message.answer("Вы в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
+            await send_retry_html(bot, message.chat.id, "Вы в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
             return
-        await message.answer("Команда не распознана. Доступно: /start, /help, /signal, /status, /code, /ping, /health, /backtest, /price")
+        await send_retry_html(bot, message.chat.id, "Команда не распознана. Доступно: /start, /help, /signal, /status, /code, /ping, /health, /backtest, /price")
 
 async def on_startup(bot: Bot):
     logger.info("Старт бота: проверка новостей...")
@@ -2445,7 +2512,18 @@ async def on_startup(bot: Bot):
                 sig.active = False
                 await db.update_signal(sig)
                 continue
-            asyncio.create_task(bot.send_message(sig.user_id, f"♻️ Восстановил мониторинг сигнала по {sig.symbol.split('/')[0]} {sig.side}."))
+            # Пробуем уведомить пользователя о восстановлении мониторинга; если бот заблокирован — деактивируем сигнал
+            try:
+                await send_retry_html(bot, sig.user_id, f"♻️ Восстановил мониторинг сигнала по {sig.symbol.split('/')[0]} {sig.side}.")
+            except TelegramForbiddenError as e:
+                logger.warning("Не могу отправить пользователю %s (бот заблокирован): %s — деактивирую сигнал %s", sig.user_id, e, sig.id)
+                sig.active = False
+                await db.update_signal(sig)
+                continue
+            except TelegramBadRequest as e:
+                logger.warning("BadRequest при отправке восстановления мониторинга user=%s: %s", sig.user_id, e)
+            except Exception as e:
+                logger.warning("Ошибка отправки восстановления мониторинга user=%s: %s", sig.user_id, e)
             task = asyncio.create_task(watch_signal_price(bot, sig.user_id, sig))
             active_watch_tasks.setdefault(sig.user_id, []).append(task)
         if active_sigs:
@@ -2456,25 +2534,93 @@ async def on_startup(bot: Bot):
 LOCK_HANDLE = None
 
 def acquire_lock():
+    """
+    Создание lock-файла с учётом:
+    - DISABLE_LOCK=1 — выключает лок полностью
+    - LOCK_FORCE=1 — форсированно перезаписывает лок
+    - LOCK_TTL_SEC — снимает «залипший» лок после TTL
+    - попытка проверить «жив» ли процесс по PID (если доступно)
+    """
     global LOCK_HANDLE
-    if os.path.exists(LOCK_PATH):
-        raise RuntimeError("Lock file exists. Другой инстанс уже запущен.")
-    LOCK_HANDLE = open(LOCK_PATH, "x")
-    LOCK_HANDLE.write(f"{os.getpid()} {int(time())}\n")
-    LOCK_HANDLE.flush()
+    try:
+        # Флаги/параметры из глобалей (если не объявлены выше — дефолты)
+        disable = globals().get("DISABLE_LOCK", False)
+        force = globals().get("LOCK_FORCE", False)
+        ttl = int(globals().get("LOCK_TTL_SEC", 7200))
+        lock_path = globals().get("LOCK_PATH", "neon_bot.lock")
+
+        if disable:
+            logger.warning("Lock отключён (DISABLE_LOCK=1). Запуск без блокировки.")
+            return
+
+        def pid_is_alive(pid: Optional[int]) -> bool:
+            if not pid or pid <= 0:
+                return False
+            try:
+                # posix-проверка "жив ли процесс"
+                if hasattr(os, "kill"):
+                    os.kill(pid, 0)
+                    return True
+            except OSError:
+                return False
+            except Exception:
+                return False
+            return False
+
+        if os.path.exists(lock_path):
+            # читаем pid и ts
+            try:
+                with open(lock_path, "r") as f:
+                    content = (f.read() or "").strip()
+                parts = content.split()
+                pid = int(parts[0]) if len(parts) >= 1 else None
+                ts0 = int(parts[1]) if len(parts) >= 2 else 0
+            except Exception:
+                pid = None
+                ts0 = 0
+
+            now_ts = int(time())
+            expired = bool(ts0 and (now_ts - ts0 > max(60, ttl)))  # нижний порог 60с
+            alive = pid_is_alive(pid)
+            same_proc = (pid == os.getpid())
+
+            if force or expired or (not alive and not same_proc):
+                with contextlib.suppress(Exception):
+                    os.remove(lock_path)
+                logger.warning("Существующий lock снят (force=%s, expired=%s, alive=%s).", force, expired, alive)
+            else:
+                raise RuntimeError("Lock file exists. Другой инстанс уже запущен.")
+
+        # создаём/перезаписываем лок
+        LOCK_HANDLE = open(lock_path, "w")
+        LOCK_HANDLE.write(f"{os.getpid()} {int(time())}\n")
+        LOCK_HANDLE.flush()
+        logger.info("Lock установлен: %s", lock_path)
+    except Exception as e:
+        # если лок отключён — просто предупредим и продолжим
+        if globals().get("DISABLE_LOCK", False):
+            logger.warning("Ошибка lock проигнорирована (DISABLE_LOCK=1): %s", e)
+            return
+        raise
 
 def release_lock():
     try:
+        if globals().get("DISABLE_LOCK", False):
+            return
+        lock_path = globals().get("LOCK_PATH", "neon_bot.lock")
         if LOCK_HANDLE:
-            LOCK_HANDLE.close()
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
+            try:
+                LOCK_HANDLE.close()
+            except Exception:
+                pass
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+            logger.info("Lock снят: %s", lock_path)
     except Exception:
         pass
 
 async def main():
     global db
-    if not DISABLE_LOCK:
     acquire_lock()
     if PROMETHEUS_OK and METRICS_PORT > 0:
         with contextlib.suppress(Exception):
@@ -2490,15 +2636,27 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
-        if not DISABLE_LOCK:
-            release_lock()
+        release_lock()
 
+# Опциональная загрузка улучшений TA: через переменную окружения TA_PATCH_MODULE.
+# Если не задано или модуль не найден — тихо пропускаем.
 try:
-    import main as neon_ta  
-    neon_ta.patch(globals())
-    logger.info("Enhanced TA module loaded.")
+    ta_module = os.getenv("TA_PATCH_MODULE", "").strip()
+    if ta_module:
+        import importlib
+        neon_ta = importlib.import_module(ta_module)
+        if hasattr(neon_ta, "patch"):
+            neon_ta.patch(globals())
+            logger.info("Enhanced TA module loaded from %s.", ta_module)
+        else:
+            logger.warning("TA module %s не содержит patch(), пропускаю.", ta_module)
+    else:
+        # Раньше пытались импортировать main — теперь не делаем этого по умолчанию
+        logger.info("TA_PATCH_MODULE не задан — пропускаю опциональные улучшения TA.")
+except ModuleNotFoundError:
+    logger.warning("TA модуль не найден, улучшения TA пропущены.")
 except Exception as _e:
-    logger.exception("Не удалось загрузить улучшения TA: %s", _e)
+    logger.warning("Не удалось загрузить улучшения TA: %s", _e)
 
 if __name__ == "__main__":
     try:
