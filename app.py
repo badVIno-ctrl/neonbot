@@ -4,6 +4,10 @@ import os
 import re
 import json
 import math
+import errno
+import ctypes
+import errno
+import ctypes
 import calendar
 import contextlib
 from dataclasses import dataclass, field
@@ -1824,10 +1828,9 @@ async def cmd_price(message: Message, command: CommandObject, bot: Bot):
         await message.answer(f"{base}: {format_price(float(last))}")
 
 @router.message(F.text == "Поддержка")
+@router.message(Command("sapport"))
+@router.message(Command("support"))
 async def on_support(message: Message, bot: Bot):
-    if not await is_user_subscribed(bot, message.from_user.id):
-        await message.answer("Подпишитесь на канал, чтобы пользоваться ботом:", reply_markup=start_keyboard())
-        return
     st = await db.get_user_state(message.from_user.id)
     if st.get("support_mode"):
         await message.answer("Вы уже в режиме поддержки. Напишите ваш вопрос.", reply_markup=support_kb())
@@ -1845,10 +1848,22 @@ async def on_support_back_btn(message: Message, bot: Bot):
     await message.answer("Вы вернулись к основному функционалу.", reply_markup=main_menu_kb(st.get("unlimited", False)))
 
 @router.callback_query(F.data == "support_user_back")
-async def cb_support_user_back(cb: CallbackQuery):
+async def cb_support_user_back(cb: CallbackQuery, bot: Bot):
     await db.set_support_mode(cb.from_user.id, False)
     st = await db.get_user_state(cb.from_user.id)
-    await cb.message.answer("Вы вернулись к основному функционалу.", reply_markup=main_menu_kb(st.get("unlimited", False)))
+
+    # Если пользователь не подписан — показываем приглашение подписаться
+    if not await is_user_subscribed(bot, cb.from_user.id):
+        await cb.message.answer(
+            "Вы вышли из режима поддержки. Для доступа к функциям подпишитесь на канал.",
+            reply_markup=start_keyboard()
+        )
+    else:
+        # Подписан — возвращаем основное меню
+        await cb.message.answer(
+            "Вы вернулись к основному функционалу.",
+            reply_markup=main_menu_kb(st.get("unlimited", False))
+        )
     await cb.answer("Режим поддержки отключён")
 
 @router.callback_query(F.data == "support_user_reply")
@@ -1870,9 +1885,13 @@ class UserSupportFilter(Filter):
 
 class AdminReplyFilter(Filter):
     async def __call__(self, message: Message) -> bool:
-        if not message.from_user:
+        if not message.from_user or not message.text:
             return False
-        return message.from_user.id in support_reply_targets and bool(message.text)
+        # Не перехватываем команды — админ может пользоваться ботом,
+        # а «режим ответа» подождёт первого обычного сообщения
+        if message.text.startswith("/"):
+            return False
+        return message.from_user.id in support_reply_targets
 
 def user_display_name(u: Any) -> str:
     if not u:
