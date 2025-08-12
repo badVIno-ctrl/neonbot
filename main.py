@@ -1,4 +1,3 @@
-
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 import os
@@ -465,7 +464,6 @@ def _fetch_funding_rate(market, symbol: str) -> Optional[float]:
 def _fetch_open_interest(market, symbol: str) -> Optional[float]:
     try:
         for name, ex in market._available_exchanges():
-            # разные биржи: fetchOpenInterest или fetchOpenInterestHistory
             resolved = market.resolve_symbol(ex, symbol) or symbol
             if resolved not in ex.markets:
                 continue
@@ -476,7 +474,6 @@ def _fetch_open_interest(market, symbol: str) -> Optional[float]:
                         val = oi.get("openInterest") or oi.get("info", {}).get("openInterest")
                         if val is not None:
                             return float(val)
-                # history — можно брать последнее значение
                 if hasattr(ex, "fetchOpenInterestHistory"):
                     arr = ex.fetchOpenInterestHistory(resolved, limit=2)
                     if isinstance(arr, list) and arr:
@@ -490,7 +487,6 @@ def _fetch_open_interest(market, symbol: str) -> Optional[float]:
     return None
 
 def _basis_spot_perp(market, symbol: str) -> Optional[float]:
-    # пытаемся взять spot и линейный swap по одному эксчейнджу
     base, quote = symbol.split("/")
     try:
         for name, ex in market._available_exchanges():
@@ -537,9 +533,18 @@ def _cvd_slope(df: pd.DataFrame, window: int = 60) -> Optional[float]:
     cvd = np.cumsum(delta)
     return float(cvd[-1] - cvd[-window])
 
+def _cvd_tickrule(df: pd.DataFrame, window: int = 120) -> Optional[float]:
+    if df is None or len(df) < window + 5:
+        return None
+    p = df["close"].astype(float).values
+    v = df["volume"].astype(float).values
+    sign = np.sign(np.diff(p, prepend=p[0]))
+    delta = sign * v
+    cvd = np.cumsum(delta)
+    return float(cvd[-1] - cvd[-window])
+
 # ---------------- Volume profile (POC/VAH/VAL) ----------------
 def _volume_profile(df: pd.DataFrame, bins: int = 40, lookback: int = 240) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    # Аппрокс: распределяем объёмы по типичной цене (tp) последних lookback баров
     if df is None or len(df) < 20:
         return None, None, None
     x = df.tail(lookback).copy()
@@ -555,7 +560,6 @@ def _volume_profile(df: pd.DataFrame, bins: int = 40, lookback: int = 240) -> Tu
         return None, None, None
     poc_idx = int(np.argmax(hist))
     poc = float(0.5 * (edges[poc_idx] + edges[poc_idx + 1]))
-    # Value Area ~ 68% веса вокруг POC
     total = hist.sum()
     order = np.argsort(hist)[::-1]
     acc = 0.0
@@ -571,7 +575,7 @@ def _volume_profile(df: pd.DataFrame, bins: int = 40, lookback: int = 240) -> Tu
 
 # ---------------- Order book stats ----------------
 def _orderbook_stats(market, symbol: str, depth: int = 25) -> Dict[str, Any]:
-    out = {"imb": None, "ask_wall": False, "bid_wall": False}
+    out = {"imb": None, "ask_wall": False, "bid_wall": False, "mp_imb": None}
     try:
         for name, ex in market._available_exchanges():
             resolved = market.resolve_symbol(ex, symbol) or symbol
@@ -585,7 +589,6 @@ def _orderbook_stats(market, symbol: str, depth: int = 25) -> Dict[str, Any]:
                 sa = float(sum([a[1] for a in asks[:depth]]) or 0.0)
                 if sb + sa > 0:
                     out["imb"] = float((sb - sa) / (sb + sa))
-                # стены: если топ-уровень сильно выше медианы
                 def wall(levels):
                     if not levels:
                         return False
@@ -594,6 +597,15 @@ def _orderbook_stats(market, symbol: str, depth: int = 25) -> Dict[str, Any]:
                     return bool(np.max(sizes) > 3.5 * med and np.max(sizes) > 0.0)
                 out["ask_wall"] = wall(asks)
                 out["bid_wall"] = wall(bids)
+                try:
+                    if asks and bids:
+                        pa, qa = asks[0][0], asks[0][1]
+                        pb, qb = bids[0][0], bids[0][1]
+                        mp = (pa * qb + pb * qa) / (qa + qb + 1e-9)
+                        mid = 0.5 * (pa + pb)
+                        out["mp_imb"] = float((mp - mid) / (mid + 1e-9))
+                except Exception:
+                    pass
                 return out
             except Exception:
                 continue
@@ -672,6 +684,192 @@ def _parse_weights_env(env_name: str) -> Dict[str, float]:
                 continue
     return out
 
+# ---------------- New: Market regime / cycles / RS / seasonality ----------------
+def _hurst_exponent(close: pd.Series, window: int = 400) -> Optional[float]:
+    if len(close) < window + 5:
+        return None
+    x = close.tail(window).values.astype(float)
+    n = len(x)
+    lags = np.arange(2, min(100, n // 3))
+    if len(lags) < 5:
+        return None
+    taus = []
+    dx = np.diff(x)
+    for lag in lags:
+        v = dx[lag:] - dx[:-lag]
+        taus.append(np.sqrt(np.std(v) + 1e-12))
+    slope, _ = np.polyfit(np.log(lags), np.log(np.array(taus) + 1e-12), 1)
+    hurst = slope * 2.0
+    return float(min(1.0, max(0.0, hurst)))
+
+def _half_life(close: pd.Series, window: int = 300) -> Optional[float]:
+    if len(close) < window + 2:
+        return None
+    y = close.tail(window).values.astype(float)
+    dy = np.diff(y)
+    x = y[:-1] - y[:-1].mean()
+    if np.std(x) < 1e-12:
+        return None
+    beta = np.dot(x, dy) / (np.dot(x, x) + 1e-12)
+    if beta >= 0:
+        return None
+    hl = -np.log(2) / beta
+    return float(min(1000.0, max(1.0, hl)))
+
+def _dominant_cycle_period(close: pd.Series, min_p: int = 10, max_p: int = 60) -> Tuple[Optional[int], Optional[float]]:
+    x = close.pct_change().dropna().tail(max_p * 3).values
+    if len(x) < max_p + 5:
+        return None, None
+    best_p, best_r = None, -1e9
+    for p in range(min_p, max_p + 1):
+        r = np.corrcoef(x[:-p], x[p:])[0, 1]
+        if np.isfinite(r) and r > best_r:
+            best_r, best_p = r, p
+    return best_p, float(best_r) if best_p else (None, None)
+
+def _rel_strength_ratio(a: pd.Series, b: pd.Series, win: int = 240) -> Optional[float]:
+    n = min(len(a), len(b))
+    if n < win + 2:
+        return None
+    y = np.log((a.tail(win).values + 1e-9) / (b.tail(win).values + 1e-9))
+    x = np.arange(len(y))
+    sl, _ = np.polyfit(x, y, 1)
+    return float(sl)
+
+def _seasonality_score(ts: pd.Timestamp) -> float:
+    try:
+        ts = pd.to_datetime(ts, utc=True)
+    except Exception:
+        return 0.0
+    h = ts.hour; dow = ts.dayofweek
+    s = 0.0
+    if h in (13, 14, 15): s += 0.05
+    if dow in (0, 2): s += 0.05
+    return float(s)
+
+# ---------------- Key-levels / CME gaps / Quality ----------------
+def _key_levels(df15: pd.DataFrame, df1h: Optional[pd.DataFrame], df1d: Optional[pd.DataFrame]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    try:
+        if df1d is not None and len(df1d) >= 2:
+            out["PDH"] = float(df1d["high"].iloc[-2])
+            out["PDL"] = float(df1d["low"].iloc[-2])
+            out["PDC"] = float(df1d["close"].iloc[-2])
+            out["PDO"] = float(df1d["open"].iloc[-1])
+        # Внутридневные high/low текущей сессии
+        if df15 is not None and len(df15) >= 10:
+            ts_last = pd.to_datetime(df15["ts"].iloc[-1], utc=True)
+            anchor = _anchor_day_from_ts(ts_last)
+            cur = df15[df15["ts"] >= pd.Timestamp(anchor, tz=timezone.utc)]
+            if not cur.empty:
+                out["SDH"] = float(cur["high"].max())
+                out["SDL"] = float(cur["low"].min())
+    except Exception:
+        pass
+    return out
+
+def _cme_gap_approx(df1h: pd.DataFrame) -> Optional[Tuple[float, float]]:
+    # Грубая аппроксимация: «gap» между последним 21:00 UTC пятницы и открытием 00:00 UTC понедельника
+    try:
+        if df1h is None or len(df1h) < 400:
+            return None
+        x = df1h.copy()
+        x["ts"] = pd.to_datetime(x["ts"], utc=True)
+        x["dow"] = x["ts"].dt.dayofweek; x["hour"] = x["ts"].dt.hour
+        fri = x[(x["dow"] == 4) & (x["hour"] == 21)]
+        mon = x[(x["dow"] == 0) & (x["hour"] == 0)]
+        if fri.empty or mon.empty:
+            return None
+        last_fri = float(fri["close"].iloc[-1]); first_mon = float(mon["open"].iloc[-1])
+        gap = first_mon - last_fri
+        return float(gap), float(first_mon)
+    except Exception:
+        return None
+
+def _fvg_quality(df: pd.DataFrame, fvg: Dict[str, float], atrv: float) -> float:
+    try:
+        width = abs(fvg["upper"] - fvg["lower"])
+        w_atr = width / (atrv + 1e-9)
+        age = (len(df) - fvg["bar"]) / 96.0
+        q = 0.6 * min(1.0, 1.5 / (w_atr + 1e-9)) + 0.4 * min(1.0, age / 2.0)
+        return float(max(0.0, min(1.0, q)))
+    except Exception:
+        return 0.5
+
+def _naked_poc_today(df15: pd.DataFrame, poc: Optional[float]) -> bool:
+    if poc is None or df15 is None or df15.empty:
+        return False
+    try:
+        ts_last = pd.to_datetime(df15["ts"].iloc[-1], utc=True)
+        anchor = _anchor_day_from_ts(ts_last)
+        day = df15[df15["ts"] >= pd.Timestamp(anchor, tz=timezone.utc)]
+        if day.empty:
+            return False
+        atrv = float(_true_range(day["high"], day["low"], day["close"]).rolling(14).mean().iloc[-1])
+        d = float(np.min(np.abs(day["close"].astype(float).values - poc)))
+        return bool(d > 0.15 * atrv)
+    except Exception:
+        return False
+
+# ---------------- Microstructure / DTW / Bayes ----------------
+def _sweep_detector(df5: pd.DataFrame, k: float = 2.5) -> bool:
+    if df5 is None or len(df5) < 40:
+        return False
+    body = (df5["close"] - df5["open"]).abs()
+    bZ = (body - body.rolling(30).mean()) / (body.rolling(30).std(ddof=0) + 1e-12)
+    vZ = (df5["volume"] - df5["volume"].rolling(30).mean()) / (df5["volume"].rolling(30).std(ddof=0) + 1e-12)
+    return bool((bZ.iloc[-1] > k and vZ.iloc[-1] > k))
+
+def _dtw_distance(a: np.ndarray, b: np.ndarray, w: int = 10) -> float:
+    n, m = len(a), len(b)
+    w = max(w, abs(n - m))
+    inf = 1e18
+    dp = np.full((n + 1, m + 1), inf, dtype=float)
+    dp[0, 0] = 0.0
+    for i in range(1, n + 1):
+        j0 = max(1, i - w); j1 = min(m, i + w)
+        for j in range(j0, j1 + 1):
+            cost = abs(a[i - 1] - b[j - 1])
+            dp[i, j] = cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
+    return float(dp[n, m] / (n + m))
+
+def _knn_dtw_edge(df5: pd.DataFrame, window: int = 48, horizon: int = 12, step: int = 4, k: int = 10) -> Optional[Tuple[float, int]]:
+    if df5 is None or len(df5) < window + horizon + 50:
+        return None
+    c = df5["close"].astype(float).values
+    ret = np.diff(c) / (c[:-1] + 1e-12)
+    target = _znorm(ret[-window:])
+    dists, fwd = [], []
+    for i in range(window + horizon, len(ret) - horizon, step):
+        seg = _znorm(ret[i - window:i])
+        d = _dtw_distance(seg, target, w=6)
+        dists.append(d); fwd.append(float(np.sum(ret[i:i + horizon])))
+    idx = np.argsort(dists)[:k]
+    if len(idx) == 0:
+        return None
+    return float(np.mean(np.array(fwd)[idx]) * 100.0), int(len(idx))
+
+def _combine_bayes(probs: List[float], pri: float = 0.5) -> float:
+    logits = []
+    for p in probs:
+        if p <= 0.0 or p >= 1.0:
+            continue
+        logits.append(math.log(p / (1.0 - p) + 1e-9))
+    z = math.log(pri / (1.0 - pri) + 1e-9) + sum(logits)
+    return float(1.0 / (1.0 + math.exp(-z)))
+
+def _bootstrap_conf(values: List[float], n: int = 200) -> float:
+    if not values:
+        return 0.0
+    arr = np.array(values, dtype=float)
+    probs = []
+    rng = np.random.default_rng(42)
+    for _ in range(n):
+        sample = rng.choice(arr, size=len(arr), replace=True)
+        probs.append(float(np.mean(sample)))
+    lo, hi = np.percentile(probs, [5, 95])
+    return float(max(0.0, hi - lo))
+
 # ---------------- Patch entry ----------------
 def patch(app: Dict[str, Any]) -> None:
     logger = app.get("logger")
@@ -709,12 +907,12 @@ def patch(app: Dict[str, Any]) -> None:
     market = app["market"]
     ema = app["ema"]; rsi = app["rsi"]; macd = app["macd"]
     atr = app["atr"]; adx = app["adx"]
-    anchored_vwap = app["anchored_vwap"]; week_anchor_from_df = app["week_anchor_from_df"]
+    anchored_vwap = app["anchored_vwap"]; week_anchor_from_df = app.get("week_anchor_from_df", None)
     prev_session_levels = app["prev_session_levels"]
     supertrend = app["supertrend"]; chandelier_exit_level = app["chandelier_exit_level"]
     format_price = app["format_price"]
 
-    # ENV-конфиги
+    # ENV-конфиги (существующие + новые)
     TA_SMC = int(os.getenv("TA_SMC", "1"))
     TA_ZIGZAG_PCT = float(os.getenv("TA_ZIGZAG_PCT", "1.0"))
     TA_VWAP_BANDS = int(os.getenv("TA_VWAP_BANDS", "1"))
@@ -736,6 +934,48 @@ def patch(app: Dict[str, Any]) -> None:
     TA_ML_BIAS = float(os.getenv("TA_ML_BIAS", "0.0"))
     TA_ML_WEIGHTS = _parse_weights_env("TA_ML_WEIGHTS")  # пример: "rvol:0.3,adx:0.2,chop:-0.1,nn:0.15,btcdom:-0.2"
 
+    # Новые ENV
+    TA_HURST = int(os.getenv("TA_HURST", "1"))
+    TA_CYCLE = int(os.getenv("TA_CYCLE", "1"))
+    TA_KEY_LEVELS = int(os.getenv("TA_KEY_LEVELS", "1"))
+    TA_CME_GAPS = int(os.getenv("TA_CME_GAPS", "1"))
+    TA_MICRO = int(os.getenv("TA_MICRO", "1"))
+    TA_HISTORY_DTW = int(os.getenv("TA_HISTORY_DTW", "1"))
+    TA_BAYES = int(os.getenv("TA_BAYES", "1"))
+    TA_RS = int(os.getenv("TA_RS", "1"))
+    TA_SEASON = int(os.getenv("TA_SEASON", "1"))
+
+    # Веса (ENV override)
+    def _w(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return default
+
+    W_FVG = _w("TA_W_FVG", 0.10)
+    W_OB = _w("TA_W_OB", 0.20)
+    W_VWAP = _w("TA_W_VWAP", -0.10)  # штраф за близость к σ-границам
+    W_NR = _w("TA_W_NR", 0.05)
+    W_GAP = _w("TA_W_GAP", 0.05)
+    W_DON = _w("TA_W_DON", 0.10)
+    W_BOS = _w("TA_W_BOS", 0.20)
+    W_ZZ = _w("TA_W_ZZ", 0.15)
+    W_CHANNEL = _w("TA_W_CHANNEL", 0.10)
+    W_BTC_DOM = _w("TA_W_BTC_DOM", 0.20)
+    W_BREADTH = _w("TA_W_BREADTH", 0.20)
+    W_FUND = _w("TA_W_FUND", -0.20)
+    W_BASIS = _w("TA_W_BASIS", -0.10)
+    W_CVD = _w("TA_W_CVD", 0.10)
+    W_L2IMB = _w("TA_W_L2IMB", 0.10)
+    W_L2WALL = _w("TA_W_L2WALL", -0.10)
+    W_POCVA = _w("TA_W_POCVA", 0.10)
+    W_MLGATE = _w("TA_W_MLGATE", -0.25)
+    W_REGIME_H = _w("TA_W_REGIME_H", 0.15)
+    W_PDH = _w("TA_W_PDH", -0.10)
+    W_PDL = _w("TA_W_PDL", -0.10)
+    W_CMEGAP = _w("TA_W_CMEGAP", -0.05)
+    W_RS = _w("TA_W_RS", 0.10)
+
     TRAIL_ATR_CAP = app.get("TRAIL_ATR_CAP", 0.30)
 
     # Кэш профилей актива (адаптивные пороги)
@@ -748,7 +988,6 @@ def patch(app: Dict[str, Any]) -> None:
         if ent and now_ts - ent.get("ts", 0) < 600:
             return ent
         try:
-            # ATR% и ADX квантиль на окне
             atr_series = atr(df15, 14) / (df15["close"].astype(float) + 1e-12) * 100.0
             adx_series = adx(df15, 14)
             atr_q20 = float(np.nanpercentile(atr_series.tail(TA_ASSET_PROFILE_LOOKBACK), 20))
@@ -762,50 +1001,51 @@ def patch(app: Dict[str, Any]) -> None:
 
     # ---------- Enhanced reason ----------
     def _enhanced_reason(details: Dict[str, Any]) -> str:
-        base = ""
+        base_txt = ""
         try:
-            base = orig_build_reason(details) if orig_build_reason else ""
+            base_txt = orig_build_reason(details) if orig_build_reason else ""
         except Exception:
-            base = ""
+            base_txt = ""
         extra_bits = []
         # SMC
-        if details.get("fvg_near"): extra_bits.append(f"FVG {details.get('fvg_type','?')}")
+        if details.get("fvg_near"): extra_bits.append(f"FVG {details.get('fvg_type','?')}{' q=%.2f'%details.get('fvg_q',0.0) if 'fvg_q' in details else ''}")
         if details.get("ob_near"): extra_bits.append(f"OB {details.get('ob_type','?')}")
         if details.get("eqh") or details.get("eql"): extra_bits.append(("EQH" if details.get("eqh") else "") + (" EQL" if details.get("eql") else ""))
         if details.get("sfp"): extra_bits.append("SFP/2B")
         if details.get("bos_disp"): extra_bits.append("BOS↑" if details.get("bos_disp_dir") == "up" else "BOS↓")
-        # Каналы/фракталы/zigzag
         if details.get("zz_trend"): extra_bits.append(f"ZigZag {details['zz_trend']}")
         if details.get("channel_conf"): extra_bits.append("Channel confluence")
-        # Профиль
         if details.get("poc") is not None: extra_bits.append("POC/VA")
-        # Гэпы
+        if details.get("naked_poc"): extra_bits.append("naked POC")
         if details.get("gap_15m"): extra_bits.append(f"Gap15 {details.get('gap15_dir','')}")
         if details.get("gap_1h"): extra_bits.append(f"Gap1h {details.get('gap1h_dir','')}")
-        # Паттерны
         if details.get("pattern_list"): extra_bits.append("Pattern: " + ", ".join(details["pattern_list"][:2]))
-        # История
         if "nn_edge" in details and details["nn_edge"] is not None: extra_bits.append(f"History {details['nn_edge']:+.2f}% (k={details.get('nn_k',0)})")
-        # BTC.D + breadth
+        if "nn_edge_dtw" in details and details["nn_edge_dtw"] is not None: extra_bits.append(f"DTW {details['nn_edge_dtw']:+.2f}%")
         if details.get("btc_dom_trend"): extra_bits.append(f"BTC.D {details['btc_dom_trend']}")
         if "breadth_pct50_1h" in details: extra_bits.append(f"Breadth {details['breadth_pct50_1h']:.0f}%")
-        # Ордерфлоу
         if "ob_imb" in details and details["ob_imb"] is not None: extra_bits.append(f"OB-imb {details['ob_imb']:+.2f}")
         if details.get("ask_wall") or details.get("bid_wall"): extra_bits.append("walls")
+        if "mp_imb" in details and details["mp_imb"] is not None: extra_bits.append(f"microprice {details['mp_imb']:+.3f}")
         if "cvd_slope" in details and details["cvd_slope"] is not None: extra_bits.append(f"CVD {details['cvd_slope']:+.0f}")
+        if "cvd_tr" in details and details["cvd_tr"] is not None: extra_bits.append(f"CVD_TR {details['cvd_tr']:+.0f}")
         if "basis" in details and details["basis"] is not None: extra_bits.append(f"basis {details['basis']*100:+.2f}%")
         if "funding_rate" in details and details["funding_rate"] is not None: extra_bits.append(f"funding {details['funding_rate']*100:.3f}%/8h")
-        # RVOL / FDI / CHOP / режим
         if "rvol_combo" in details: extra_bits.append(f"RVOL x{details['rvol_combo']:.2f}")
         if "fdi" in details and details["fdi"] is not None: extra_bits.append(f"FDI {details['fdi']:.2f}")
         if details.get("nr4"): extra_bits.append("NR4")
         if details.get("nr7"): extra_bits.append("NR7")
         if details.get("vol_regime"): extra_bits.append(f"reg {details['vol_regime']}")
-
-        # ML-фильтр
-        if "ml_p" in details and details["ml_p"] is not None:
-            extra_bits.append(f"ML p={details['ml_p']:.2f}")
-
+        if "hurst" in details and details["hurst"] is not None: extra_bits.append(f"H {details['hurst']:.2f}")
+        if "half_life" in details and details["half_life"] is not None: extra_bits.append(f"HL {details['half_life']:.0f}")
+        if "cyc_p" in details and details["cyc_p"] is not None: extra_bits.append(f"cyc {details['cyc_p']}")
+        if "RS_btc" in details and details["RS_btc"] is not None: extra_bits.append(f"RS/BTC {details['RS_btc']:+.3e}")
+        if "RS_eth" in details and details["RS_eth"] is not None: extra_bits.append(f"RS/ETH {details['RS_eth']:+.3e}")
+        if "p_bayes" in details and details["p_bayes"] is not None:
+            txt = f"p*={details['p_bayes']:.2f}"
+            if "p_ci" in details:
+                txt += f"±{details['p_ci']:.2f}"
+            extra_bits.append(txt)
         # Score breakdown (топ 3)
         br = details.get("score_breakdown", {})
         if isinstance(br, dict) and br:
@@ -813,9 +1053,9 @@ def patch(app: Dict[str, Any]) -> None:
             if parts:
                 extra_bits.append("[" + ", ".join([f"{k}:{v:+.2f}" for k, v in parts]) + "]")
         extra = " • ".join([x for x in extra_bits if x])
-        if base and extra:
-            return f"{base} • {extra}"
-        return base or extra
+        if base_txt and extra:
+            return f"{base_txt} • {extra}"
+        return base_txt or extra
 
     # ---------- Enhanced trailing ----------
     async def _enhanced_update_trailing(sig) -> None:
@@ -829,6 +1069,7 @@ def patch(app: Dict[str, Any]) -> None:
             tick = market.get_tick_size(sig.symbol)
             ema21 = ema(df15["close"], 21)
             vwap_day = anchored_vwap(df15)
+            poc, vah, val = _volume_profile(df15, bins=40, lookback=240)
 
             if not hasattr(sig, "_init_sl"):
                 sig._init_sl = float(sig.sl)
@@ -850,7 +1091,9 @@ def patch(app: Dict[str, Any]) -> None:
                 if sig.tp_hit >= 1 and sig._vwap_tests >= 3:
                     stp = max(stp, float(ema21.iloc[-1]), float(vwap_day.iloc[-1]))
                 if sig.tp_hit >= 2 and hasattr(sig, "_init_r"):
-                    stp = max(stp, float(sig.entry) + 0.3 * float(sig._init_r))
+                    stp = max(stp, float(sig.entry) + 0.5 * float(sig._init_r))
+                if poc is not None:
+                    stp = max(stp, poc)  # lock-in над POC
                 stp = max(stp, float(sig.entry) - TRAIL_ATR_CAP * atr_val)
                 stp = _round_to_tick(stp, tick, "floor")
                 if stp > sig.sl:
@@ -861,7 +1104,9 @@ def patch(app: Dict[str, Any]) -> None:
                 if sig.tp_hit >= 1 and sig._vwap_tests >= 3:
                     stp = min(stp, float(ema21.iloc[-1]), float(vwap_day.iloc[-1]))
                 if sig.tp_hit >= 2 and hasattr(sig, "_init_r"):
-                    stp = min(stp, float(sig.entry) - 0.3 * float(sig._init_r))
+                    stp = min(stp, float(sig.entry) - 0.5 * float(sig._init_r))
+                if poc is not None:
+                    stp = min(stp, poc)
                 stp = min(stp, float(sig.entry) + TRAIL_ATR_CAP * atr_val)
                 stp = _round_to_tick(stp, tick, "ceil")
                 if stp < sig.sl:
@@ -874,11 +1119,12 @@ def patch(app: Dict[str, Any]) -> None:
         try:
             df15 = market.fetch_ohlcv(symbol, "15m", 240)
             df5 = market.fetch_ohlcv(symbol, "5m", 360)
+            df1h = market.fetch_ohlcv(symbol, "1h", 260)
+            df1d = market.fetch_ohlcv(symbol, "1d", 200)
             if df15 is None or df5 is None:
                 return None
             vwap_day = anchored_vwap(df15)
             c15 = float(df15["close"].iloc[-1]); vd = float(vwap_day.iloc[-1])
-
             ha5 = _heikin_ashi_df(df5.set_index("ts").reset_index())
             ha_bear = bool(ha5["close"].iloc[-1] < ha5["open"].iloc[-1])
             ha_bull = not ha_bear
@@ -887,11 +1133,8 @@ def patch(app: Dict[str, Any]) -> None:
             st_last = int(st_dir.iloc[-1]); st_prev = int(st_dir.iloc[-2]) if len(st_dir) >= 2 else st_last
 
             shocked, dir_, z = _btc_shock(market, lookback=96, sigma_thr=TA_BTC_SHOCK_SIGMA)
-
-            # BTC.D spike / basis shock
             bdom, ddom = _fetch_btc_dominance()
             basis = _basis_spot_perp(market, symbol)
-
             atr15 = float(atr(df15, 14).iloc[-1])
             amp = float(df5["high"].tail(TA_TIME_STOP_BARS).max() - df5["low"].tail(TA_TIME_STOP_BARS).min()) if len(df5) >= TA_TIME_STOP_BARS else float("inf")
             stagnation = bool(amp < 0.5 * atr15)
@@ -899,23 +1142,34 @@ def patch(app: Dict[str, Any]) -> None:
             mom_fail_long = (np.all(np.diff(df5["high"].tail(6)) < 0) if len(df5) >= 6 else False) and c15 < vd
             mom_fail_short = (np.all(np.diff(df5["low"].tail(6)) > 0) if len(df5) >= 6 else False) and c15 > vd
 
+            # Key-levels
+            kl = _key_levels(df15, df1h, df1d)
+            PDH = kl.get("PDH"); PDL = kl.get("PDL")
+
+            # Sweep detector
+            swept = _sweep_detector(df5, k=2.5)
+
             msgs = []
             if side == "LONG":
                 if st_last < 0 and st_prev < 0: msgs.append("SuperTrend(15m) уверенно вниз.")
                 if c15 < vd and ha_bear and rsi5 < 45: msgs.append("Потеря VWAP, HA(5m) медв., RSI<45.")
+                if PDH and (PDH - c15) < 0.3 * atr15: msgs.append("Под самым PDH — риск отката.")
                 if shocked and dir_ < 0: msgs.append(f"BTC shock {z:.1f}σ вниз.")
                 if stagnation: msgs.append("Стагнация диапазона — подумать о частичной фиксации.")
                 if mom_fail_long: msgs.append("Momentum failure: lower highs и ниже VWAP.")
                 if ddom is not None and ddom > 0.15: msgs.append("BTC.D spike вверх — риск для альтов.")
-                if basis is not None and basis < -0.004: msgs.append("Негат. basis — риск для лонга.")
+                if basis is not None and basis < -0.004: msgs.append("Негативный basis — риск для лонга.")
+                if swept: msgs.append("Обнаружен sweep/пролив объёма.")
             else:
                 if st_last > 0 and st_prev > 0: msgs.append("SuperTrend(15m) уверенно вверх.")
                 if c15 > vd and ha_bull and rsi5 > 55: msgs.append("Выше VWAP, HA(5m) быч., RSI>55.")
+                if PDL and (c15 - PDL) < 0.3 * atr15: msgs.append("Над самым PDL — риск отскока.")
                 if shocked and dir_ > 0: msgs.append(f"BTC shock {z:.1f}σ вверх.")
                 if stagnation: msgs.append("Стагнация диапазона — подумать о частичной фиксации.")
                 if mom_fail_short: msgs.append("Momentum failure: higher lows и выше VWAP.")
                 if ddom is not None and ddom < -0.15: msgs.append("BTC.D spike вниз — риск для доминации альтов (шортам осторожно).")
-                if basis is not None and basis > 0.004: msgs.append("Позит. basis — риск для шорта.")
+                if basis is not None and basis > 0.004: msgs.append("Позитивный basis — риск для шорта.")
+                if swept: msgs.append("Обнаружен sweep/выкуп объёма.")
             if msgs:
                 return " ".join(msgs[:2])
             return None
@@ -942,6 +1196,7 @@ def patch(app: Dict[str, Any]) -> None:
         c15 = float(df15["close"].iloc[-1])
         atr15 = float(details.get("atr", None) or atr(df15, 14).iloc[-1])
         tick = market.get_tick_size(symbol)
+        entry = float(details.get("c5", c15))
 
         # RVOL/FDI/CHOP/Vol-regime
         rvol_combo = _combined_rvol(df5["volume"], df15["volume"], lk5=TA_RVOL_LK5, lk15=TA_RVOL_LK15)
@@ -953,11 +1208,22 @@ def patch(app: Dict[str, Any]) -> None:
         # Адаптивный профиль актива
         prof = _asset_profile(symbol, df15)
         atr_pct_now = float(atr15 / (c15 + 1e-12) * 100.0)
-        # штраф/бонус, если текущая волатильность сильно вне типичного диапазона актива
         if atr_pct_now < prof.get("atr_q20", 0.1):
             breakdown["AssetFit"] = breakdown.get("AssetFit", 0.0) - 0.10
         elif atr_pct_now > prof.get("atr_q80", 1.5):
             breakdown["AssetFit"] = breakdown.get("AssetFit", 0.0) + 0.05
+
+        # Hurst / Half-life / Cycle
+        if TA_HURST or TA_CYCLE:
+            H = _hurst_exponent(df15["close"], 400) if TA_HURST else None
+            HL = _half_life(df15["close"], 300) if TA_HURST else None
+            cyc, cyc_r = _dominant_cycle_period(df15["close"], 10, 60) if TA_CYCLE else (None, None)
+            details.update({"hurst": H, "half_life": HL, "cyc_p": cyc})
+            if H is not None:
+                if H > 0.55:
+                    breakdown["RegimeH"] = breakdown.get("RegimeH", 0.0) + W_REGIME_H
+                elif H < 0.45:
+                    breakdown["RegimeH"] = breakdown.get("RegimeH", 0.0) - (W_REGIME_H * 2 / 3.0)
 
         # SMC
         if TA_SMC:
@@ -967,26 +1233,28 @@ def patch(app: Dict[str, Any]) -> None:
             z, dist = _fvg_status(fvg_all, c15)
             if z:
                 d_atr = dist / max(atr15, 1e-9)
+                q = _fvg_quality(df15, z, atr15)
                 details["fvg_near"] = True
                 details["fvg_type"] = "bull" if z["type"] == 1 else "bear"
+                details["fvg_q"] = q
                 if (side == "LONG" and z["type"] == -1 and d_atr < 1.0) or (side == "SHORT" and z["type"] == 1 and d_atr < 1.0):
-                    breakdown["FVG"] = breakdown.get("FVG", 0.0) - 0.15
+                    breakdown["FVG"] = breakdown.get("FVG", 0.0) - W_FVG
                 else:
-                    breakdown["FVG"] = breakdown.get("FVG", 0.0) + 0.05
+                    breakdown["FVG"] = breakdown.get("FVG", 0.0) + (W_FVG * (0.5 + 0.5 * q))
             ob = _find_order_block(df15, side, atr_fn=atr, atr_period=14)
             if ob:
                 details["ob_near"] = True
                 details["ob_type"] = "demand" if ob["type"] == 1 else "supply"
                 if side == "LONG":
                     if ob["low"] <= c15 <= ob["high"]:
-                        breakdown["OB"] = breakdown.get("OB", 0.0) - 0.15
+                        breakdown["OB"] = breakdown.get("OB", 0.0) - (W_OB * 0.75)
                     elif c15 >= ob["low"] and (c15 - ob["low"]) / max(atr15, 1e-9) < 0.6:
-                        breakdown["OB"] = breakdown.get("OB", 0.0) + 0.20
+                        breakdown["OB"] = breakdown.get("OB", 0.0) + W_OB
                 else:
                     if ob["low"] <= c15 <= ob["high"]:
-                        breakdown["OB"] = breakdown.get("OB", 0.0) - 0.15
+                        breakdown["OB"] = breakdown.get("OB", 0.0) - (W_OB * 0.75)
                     elif c15 <= ob["high"] and (ob["high"] - c15) / max(atr15, 1e-9) < 0.6:
-                        breakdown["OB"] = breakdown.get("OB", 0.0) + 0.20
+                        breakdown["OB"] = breakdown.get("OB", 0.0) + W_OB
             eqh, eql = _equal_highs_lows(df15, lookback=50, tol_frac=0.0008)
             details["eqh"] = bool(eqh); details["eql"] = bool(eql)
             if _sfp_2b(df15, side, lookback=30):
@@ -995,7 +1263,7 @@ def patch(app: Dict[str, Any]) -> None:
             if _quasimodo_zigzag(df15["close"], pct=max(0.6, TA_ZIGZAG_PCT)):
                 breakdown["QM"] = breakdown.get("QM", 0.0) + 0.10
             if _bos_displacement(df15, side, atr_fn=atr, atr_p=14, lookback=40, k=1.2):
-                breakdown["BOS"] = breakdown.get("BOS", 0.0) + 0.20
+                breakdown["BOS"] = breakdown.get("BOS", 0.0) + W_BOS
                 details["bos_disp"] = True
                 details["bos_disp_dir"] = "up" if side == "LONG" else "down"
 
@@ -1009,13 +1277,13 @@ def patch(app: Dict[str, Any]) -> None:
         if zz_trend:
             details["zz_trend"] = zz_trend
             if side == "LONG":
-                breakdown["ZZ"] = breakdown.get("ZZ", 0.0) + (0.15 if zz_trend == "HH/HL" else -0.10)
+                breakdown["ZZ"] = breakdown.get("ZZ", 0.0) + (W_ZZ if zz_trend == "HH/HL" else -0.10)
             else:
-                breakdown["ZZ"] = breakdown.get("ZZ", 0.0) + (0.15 if zz_trend == "LH/LL" else -0.10)
+                breakdown["ZZ"] = breakdown.get("ZZ", 0.0) + (W_ZZ if zz_trend == "LH/LL" else -0.10)
         slope, intercept, lo, mid, hi = _regression_channel(df15["close"], window=120)
         conf = _channel_confluence(c15, lo, mid, hi, side)
         if conf != 0.0:
-            breakdown["Channel"] = breakdown.get("Channel", 0.0) + conf
+            breakdown["Channel"] = breakdown.get("Channel", 0.0) + (W_CHANNEL * conf / 0.25)
             details["channel_conf"] = True
 
         # VWAP бэнды
@@ -1023,14 +1291,14 @@ def patch(app: Dict[str, Any]) -> None:
             v, up1, dn1 = _vwap_sigma_bands(df15, lookback=TA_VWAP_BANDS_LOOKBACK, anchored_vwap=anchored_vwap)
             if v is not None and up1 is not None and dn1 is not None:
                 if side == "LONG" and (up1 - c15) < 0.25 * atr15:
-                    breakdown["VWAP±σ2"] = breakdown.get("VWAP±σ2", 0.0) - 0.10
+                    breakdown["VWAP±σ2"] = breakdown.get("VWAP±σ2", 0.0) + W_VWAP
                 if side == "SHORT" and (c15 - dn1) < 0.25 * atr15:
-                    breakdown["VWAP±σ2"] = breakdown.get("VWAP±σ2", 0.0) - 0.10
+                    breakdown["VWAP±σ2"] = breakdown.get("VWAP±σ2", 0.0) + W_VWAP
 
         # NR/IB/Гэпы
         nr4 = _is_nr_n(df15, 4); nr7 = _is_nr_n(df15, 7)
-        if nr4: breakdown["NR4"] = breakdown.get("NR4", 0.0) + 0.05
-        if nr7: breakdown["NR7"] = breakdown.get("NR7", 0.0) + 0.05
+        if nr4: breakdown["NR4"] = breakdown.get("NR4", 0.0) + W_NR
+        if nr7: breakdown["NR7"] = breakdown.get("NR7", 0.0) + W_NR
         details["nr4"] = bool(nr4); details["nr7"] = bool(nr7)
         ib_hi, ib_lo = _initial_balance_levels(df15, ib_hours=1)
         if ib_hi is not None and ib_lo is not None:
@@ -1044,9 +1312,9 @@ def patch(app: Dict[str, Any]) -> None:
         details["gap_1h"] = bool(gap1h); details["gap1h_dir"] = gap1h_dir
         if gap15 or gap1h:
             if (side == "LONG" and (gap15_dir == "down" or gap1h_dir == "down")) or (side == "SHORT" and (gap15_dir == "up" or gap1h_dir == "up")):
-                breakdown["Gap"] = breakdown.get("Gap", 0.0) + 0.05
+                breakdown["Gap"] = breakdown.get("Gap", 0.0) + W_GAP
             else:
-                breakdown["Gap"] = breakdown.get("Gap", 0.0) - 0.05
+                breakdown["Gap"] = breakdown.get("Gap", 0.0) - W_GAP
 
         # Паттерны (лайт)
         patterns = []
@@ -1068,22 +1336,28 @@ def patch(app: Dict[str, Any]) -> None:
                     if brk_up or brk_dn:
                         patterns.append("Hikkake")
                         breakdown["Hikkake"] = breakdown.get("Hikkake", 0.0) + 0.10
-            # Дополнительно — треугольник/флаг
-            if slope is not None and lo is not None and hi is not None:
-                width = hi - lo
+            slope_w, intercept_w, lo_w, mid_w, hi_w = _regression_channel(df15["close"], window=120)
+            if slope_w is not None and lo_w is not None and hi_w is not None:
+                width = hi_w - lo_w
                 if width < 0.7 * atr15 and nr7:
                     patterns.append("Triangle/Flag")
                     breakdown["FlagTri"] = breakdown.get("FlagTri", 0.0) + 0.10
             if patterns:
                 details["pattern_list"] = patterns
 
-        # Исторический kNN
+        # Исторический kNN (евклид) и DTW
         if TA_HISTORY_MATCH:
             nn = _knn_forward_edge(df5, window=48, horizon=12, step=4, k=12)
             if nn:
                 nn_edge, nn_k = nn
                 details["nn_edge"] = float(nn_edge); details["nn_k"] = int(nn_k)
                 breakdown["HistoryNN"] = breakdown.get("HistoryNN", 0.0) + (0.20 if ((side == "LONG" and nn_edge > 0) or (side == "SHORT" and nn_edge < 0)) else -0.10)
+        if TA_HISTORY_DTW:
+            dtw = _knn_dtw_edge(df5, window=48, horizon=12, step=4, k=10)
+            if dtw:
+                edge, kk = dtw
+                details["nn_edge_dtw"] = float(edge)
+                breakdown["HistoryDTW"] = breakdown.get("HistoryDTW", 0.0) + (0.20 if ((side == "LONG" and edge > 0) or (side == "SHORT" and edge < 0)) else -0.10)
 
         # BTC.D + breadth
         if TA_BTC_DOM or TA_BREADTH:
@@ -1097,18 +1371,18 @@ def patch(app: Dict[str, Any]) -> None:
                     if btc_d is not None:
                         trend = "up" if (ddom is not None and ddom > 0) else ("down" if (ddom is not None and ddom < 0) else "flat")
                         details["btc_dom"] = float(btc_d); details["btc_dom_trend"] = trend
-                        base = symbol.split("/")[0]
-                        is_alt = base not in ("BTC", "ETH")
+                        base_co = symbol.split("/")[0]
+                        is_alt = base_co not in ("BTC", "ETH")
                         if is_alt:
                             if side == "LONG" and trend == "up":
-                                breakdown["BTC.D"] = breakdown.get("BTC.D", 0.0) - 0.25
+                                breakdown["BTC.D"] = breakdown.get("BTC.D", 0.0) - W_BTC_DOM
                             if side == "SHORT" and trend == "up":
-                                breakdown["BTC.D"] = breakdown.get("BTC.D", 0.0) + 0.10
+                                breakdown["BTC.D"] = breakdown.get("BTC.D", 0.0) + (W_BTC_DOM * 0.5)
                         if breadth and is_alt and side == "LONG":
                             if float(breadth.get("pct50_1h", 0.0)) < 45.0:
-                                breakdown["Breadth"] = breakdown.get("Breadth", 0.0) - 0.20
+                                breakdown["Breadth"] = breakdown.get("Breadth", 0.0) - W_BREADTH
                             elif float(breadth.get("pct50_1h", 0.0)) > 60.0:
-                                breakdown["Breadth"] = breakdown.get("Breadth", 0.0) + 0.10
+                                breakdown["Breadth"] = breakdown.get("Breadth", 0.0) + (W_BREADTH * 0.5)
             except Exception:
                 pass
 
@@ -1119,9 +1393,9 @@ def patch(app: Dict[str, Any]) -> None:
                 if fr is not None:
                     details["funding_rate"] = float(fr)
                     if side == "SHORT" and fr >= 0.0006:
-                        breakdown["Funding"] = breakdown.get("Funding", 0.0) - 0.20
+                        breakdown["Funding"] = breakdown.get("Funding", 0.0) + W_FUND
                     elif side == "LONG" and fr <= -0.0006:
-                        breakdown["Funding"] = breakdown.get("Funding", 0.0) - 0.20
+                        breakdown["Funding"] = breakdown.get("Funding", 0.0) + W_FUND
             except Exception:
                 pass
         oi = _fetch_open_interest(market, symbol)
@@ -1131,30 +1405,34 @@ def patch(app: Dict[str, Any]) -> None:
         if basis is not None:
             details["basis"] = float(basis)
             if side == "LONG" and basis < -0.004:
-                breakdown["Basis"] = breakdown.get("Basis", 0.0) - 0.10
+                breakdown["Basis"] = breakdown.get("Basis", 0.0) + W_BASIS
             if side == "SHORT" and basis > +0.004:
-                breakdown["Basis"] = breakdown.get("Basis", 0.0) - 0.10
+                breakdown["Basis"] = breakdown.get("Basis", 0.0) + W_BASIS
         cvd = _cvd_slope(df5, window=60)
         if cvd is not None:
             details["cvd_slope"] = float(cvd)
             if side == "LONG" and cvd > 0:
-                breakdown["CVD"] = breakdown.get("CVD", 0.0) + 0.10
+                breakdown["CVD"] = breakdown.get("CVD", 0.0) + W_CVD
             if side == "SHORT" and cvd < 0:
-                breakdown["CVD"] = breakdown.get("CVD", 0.0) + 0.10
+                breakdown["CVD"] = breakdown.get("CVD", 0.0) + W_CVD
+        cvd_tr = _cvd_tickrule(df5, window=120) if TA_MICRO else None
+        if cvd_tr is not None:
+            details["cvd_tr"] = float(cvd_tr)
         ob_stats = _orderbook_stats(market, symbol, depth=25)
         if ob_stats:
             details["ob_imb"] = float(ob_stats.get("imb")) if ob_stats.get("imb") is not None else None
             details["ask_wall"] = bool(ob_stats.get("ask_wall", False))
             details["bid_wall"] = bool(ob_stats.get("bid_wall", False))
+            details["mp_imb"] = float(ob_stats.get("mp_imb")) if ob_stats.get("mp_imb") is not None else None
             if details["ob_imb"] is not None:
                 if side == "LONG":
-                    breakdown["L2imb"] = breakdown.get("L2imb", 0.0) + (0.10 if details["ob_imb"] > 0.15 else (-0.10 if details["ob_imb"] < -0.15 else 0.0))
+                    breakdown["L2imb"] = breakdown.get("L2imb", 0.0) + (W_L2IMB if details["ob_imb"] > 0.15 else (-W_L2IMB if details["ob_imb"] < -0.15 else 0.0))
                 else:
-                    breakdown["L2imb"] = breakdown.get("L2imb", 0.0) + (0.10 if details["ob_imb"] < -0.15 else (-0.10 if details["ob_imb"] > 0.15 else 0.0))
+                    breakdown["L2imb"] = breakdown.get("L2imb", 0.0) + (W_L2IMB if details["ob_imb"] < -0.15 else (-W_L2IMB if details["ob_imb"] > 0.15 else 0.0))
             if side == "LONG" and ob_stats.get("ask_wall", False):
-                breakdown["L2walls"] = breakdown.get("L2walls", 0.0) - 0.10
+                breakdown["L2walls"] = breakdown.get("L2walls", 0.0) + W_L2WALL
             if side == "SHORT" and ob_stats.get("bid_wall", False):
-                breakdown["L2walls"] = breakdown.get("L2walls", 0.0) - 0.10
+                breakdown["L2walls"] = breakdown.get("L2walls", 0.0) + W_L2WALL
 
         # Профиль объёма POC/VAH/VAL
         poc, vah, val = _volume_profile(df15, bins=40, lookback=240)
@@ -1162,18 +1440,36 @@ def patch(app: Dict[str, Any]) -> None:
         if poc is not None and vah is not None and val is not None:
             if side == "LONG":
                 if c15 >= vah: breakdown["POC/VA"] = breakdown.get("POC/VA", 0.0) - 0.10
-                elif c15 <= val: breakdown["POC/VA"] = breakdown.get("POC/VA", 0.0) + 0.05
+                elif c15 <= val: breakdown["POC/VA"] = breakdown.get("POC/VA", 0.0) + W_POCVA
             else:
                 if c15 <= val: breakdown["POC/VA"] = breakdown.get("POC/VA", 0.0) - 0.10
-                elif c15 >= vah: breakdown["POC/VA"] = breakdown.get("POC/VA", 0.0) + 0.05
+                elif c15 >= vah: breakdown["POC/VA"] = breakdown.get("POC/VA", 0.0) + W_POCVA
+        details["naked_poc"] = _naked_poc_today(df15, poc)
+
+        # Key-levels / CME gaps
+        if TA_KEY_LEVELS:
+            kl = _key_levels(df15, df1h, df1d)
+            details.update(kl)
+            PDH = kl.get("PDH"); PDL = kl.get("PDL")
+            if PDH and side == "LONG" and (PDH - c15) < 0.3 * atr15:
+                breakdown["PDH"] = breakdown.get("PDH", 0.0) + W_PDH
+            if PDL and side == "SHORT" and (c15 - PDL) < 0.3 * atr15:
+                breakdown["PDL"] = breakdown.get("PDL", 0.0) + W_PDL
+        if TA_CME_GAPS and df1h is not None:
+            gg = _cme_gap_approx(df1h)
+            if gg:
+                gap, open_mon = gg; details["cme_gap"] = gap
+                if abs(gap) > 0.5 * atr15:
+                    breakdown["CMEgap"] = breakdown.get("CMEgap", 0.0) + W_CMEGAP
 
         # ML-lite (если включён)
         if TA_ML_LIGHT:
             feats = {
                 "rvol": float(rvol_combo),
-                "adx": float(adx(df15, 14).iloc[-1] / 50.0),  # нормировка
+                "adx": float(adx(df15, 14).iloc[-1] / 50.0),
                 "chop": float((chop15 or 50.0) / 100.0),
                 "nn": float(details.get("nn_edge", 0.0) / 5.0),
+                "nn_dtw": float(details.get("nn_edge_dtw", 0.0) / 5.0),
                 "btcdom": float(1.0 if details.get("btc_dom_trend") == "up" else (-1.0 if details.get("btc_dom_trend") == "down" else 0.0)),
                 "breadth": float(details.get("breadth_pct50_1h", 50.0) / 100.0),
                 "basis": float(details.get("basis", 0.0) * 100.0),
@@ -1186,45 +1482,96 @@ def patch(app: Dict[str, Any]) -> None:
             }
             p = _ml_probability(feats, TA_ML_WEIGHTS, bias=TA_ML_BIAS)
             details["ml_p"] = float(p)
-            # мягкий гейтинг
             if p < TA_ML_P_THRESHOLD and not relax:
-                breakdown["MLgate"] = breakdown.get("MLgate", 0.0) - 0.25
+                breakdown["MLgate"] = breakdown.get("MLgate", 0.0) + W_MLGATE
+
+        # RS и сезонность (мягкие)
+        if TA_RS:
+            try:
+                btc5 = market.fetch_ohlcv("BTC/USDT", "5m", 300)
+                eth5 = market.fetch_ohlcv("ETH/USDT", "5m", 300)
+                if btc5 is not None:
+                    rs_btc = _rel_strength_ratio(df5["close"], btc5["close"], 240)
+                    details["RS_btc"] = rs_btc
+                    if rs_btc is not None:
+                        breakdown["RSbtc"] = breakdown.get("RSbtc", 0.0) + (W_RS if ((side == "LONG" and rs_btc > 0) or (side == "SHORT" and rs_btc < 0)) else -W_RS/2)
+                if eth5 is not None:
+                    rs_eth = _rel_strength_ratio(df5["close"], eth5["close"], 240)
+                    details["RS_eth"] = rs_eth
+            except Exception:
+                pass
+        if TA_SEASON and len(df5) > 0:
+            s = _seasonality_score(df5["ts"].iloc[-1])
+            if s != 0.0:
+                breakdown["Season"] = breakdown.get("Season", 0.0) + s
 
         # Итоговый скор
         adj = float(sum(breakdown.values()))
         side_score = float(side_score + adj)
 
-        # Адаптация TP/SL под SMC/POC
-        entry = float(details.get("c5", c15))
+        # Байесовское объединение (мягко, как индикативный p*)
+        if TA_BAYES:
+            probs = []
+            # Превращаем ряд сигналов в псевдо-вероятности
+            if "ml_p" in details and details["ml_p"] is not None:
+                probs.append(float(details["ml_p"]))
+            if "nn_edge" in details and details["nn_edge"] is not None:
+                probs.append(float(0.5 + np.tanh(details["nn_edge"] / 5.0) * 0.25))
+            if "nn_edge_dtw" in details and details["nn_edge_dtw"] is not None:
+                probs.append(float(0.5 + np.tanh(details["nn_edge_dtw"] / 5.0) * 0.25))
+            if "cvd_slope" in details and details["cvd_slope"] is not None:
+                probs.append(float(0.5 + np.tanh(details["cvd_slope"] / 1e6) * 0.25 if side == "LONG" else 0.5 - np.tanh(details["cvd_slope"] / 1e6) * 0.25))
+            if "ob_imb" in details and details["ob_imb"] is not None:
+                probs.append(float(0.5 + np.tanh(details["ob_imb"] * (1 if side=="LONG" else -1)) * 0.25))
+            if "btc_dom_trend" in details:
+                probs.append(0.45 if (side=="LONG" and details["btc_dom_trend"]=="up") else 0.55 if (side=="SHORT" and details["btc_dom_trend"]=="up") else 0.5)
+            p_star = _combine_bayes(probs, pri=0.5) if probs else None
+            details["p_bayes"] = p_star if p_star is not None else None
+            if p_star is not None:
+                ci = _bootstrap_conf(probs, n=120)
+                details["p_ci"] = ci
+
+        # Адаптация TP/SL под режимы и уровни
         tps = [float(x) for x in details.get("tps", [])]
         sl_old = float(details.get("sl"))
-        if TA_SMC and tps:
-            cap_up = None; cap_dn = None
-            if poc is not None and vah is not None and val is not None:
-                if side == "LONG": cap_up = poc if c15 < poc else vah
-                else: cap_dn = poc if c15 > poc else val
-            ob = _find_order_block(df15, side, atr_fn=atr, atr_period=14)
-            if ob:
-                if side == "LONG":
-                    cap_up = cap_up if cap_up is not None else ob["high"] + 0.25 * atr15
-                else:
-                    cap_dn = cap_dn if cap_dn is not None else ob["low"] - 0.25 * atr15
-            if cap_up is not None and side == "LONG":
-                tps = [min(tp, cap_up) for tp in tps]
-            if cap_dn is not None and side == "SHORT":
-                tps = [max(tp, cap_dn) for tp in tps]
-            if ob:
-                if side == "LONG":
-                    sl_new = min(sl_old, ob["low"] - 0.15 * atr15)
-                else:
-                    sl_new = max(sl_old, ob["high"] + 0.15 * atr15)
-                if tick:
-                    sl_new = _round_to_tick(sl_new, tick, "floor" if side == "LONG" else "ceil")
-                details["sl"] = float(sl_new)
+        # Hurst-based TP
+        H = details.get("hurst", None)
+        if H is not None and atr15 > 0 and (not details.get("tp_adjusted")):
+            if H < 0.45:
+                mul = [0.6, 1.2, 1.8]
+            elif H > 0.55:
+                mul = [1.0, 1.8, 2.8]
+            else:
+                mul = [0.8, 1.5, 2.4]
+            tps = [entry + (m * atr15 if side == "LONG" else -m * atr15) for m in mul]
+        # Cap по POC/OB
+        cap_up = None; cap_dn = None
+        if poc is not None and vah is not None and val is not None:
+            if side == "LONG": cap_up = poc if c15 < poc else vah
+            else: cap_dn = poc if c15 > poc else val
+        ob2 = _find_order_block(df15, side, atr_fn=atr, atr_period=14) if TA_SMC else None
+        if ob2:
+            if side == "LONG":
+                cap_up = cap_up if cap_up is not None else ob2["high"] + 0.25 * atr15
+            else:
+                cap_dn = cap_dn if cap_dn is not None else ob2["low"] - 0.25 * atr15
+        if cap_up is not None and side == "LONG":
+            tps = [min(tp, cap_up) for tp in tps]
+        if cap_dn is not None and side == "SHORT":
+            tps = [max(tp, cap_dn) for tp in tps]
+        # SL по OB
+        if ob2:
+            if side == "LONG":
+                sl_new = min(sl_old, ob2["low"] - 0.15 * atr15)
+            else:
+                sl_new = max(sl_old, ob2["high"] + 0.15 * atr15)
             if tick:
-                tps = [_round_to_tick(x, tick, "nearest") for x in tps]
-            details["tps"] = tps
-            details["tp_adjusted"] = True
+                sl_new = _round_to_tick(sl_new, tick, "floor" if side == "LONG" else "ceil")
+            details["sl"] = float(sl_new)
+        if tick:
+            tps = [_round_to_tick(x, tick, "nearest") for x in tps]
+        details["tps"] = tps
+        details["tp_adjusted"] = True
 
         # Сохраняем
         details["rvol_combo"] = float(rvol_combo)
@@ -1259,6 +1606,7 @@ def patch(app: Dict[str, Any]) -> None:
                     continue
                 now_ts = pytime.time()
 
+                # Периодические риск-оповещения (новости/техника)
                 if now_ts - last_risk_check > 60:
                     last_risk_check = now_ts
                     news_msg = _news_risk_trigger(sig.side, sig.news_note)
@@ -1268,41 +1616,69 @@ def patch(app: Dict[str, Any]) -> None:
                     if tech_msg and _should_alert(sig.id or -1, "tech"):
                         await bot.send_message(chat_id, f"⚠️ Риск-алерт {sig.symbol.split('/')[0]}: {tech_msg}\nРекомендация: сократить/закрыть позицию.")
 
+                # Latch/near-level подсказки (RVOL, PDH/PDL и т.д.)
                 if now_ts - last_latch_check > 45 and hasattr(sig, "tps") and sig.tps:
                     last_latch_check = now_ts
                     try:
                         df5 = market.fetch_ohlcv(sig.symbol, "5m", 220)
                         df15 = market.fetch_ohlcv(sig.symbol, "15m", 200)
+                        df1d = market.fetch_ohlcv(sig.symbol, "1d", 200)
                         if df5 is not None and df15 is not None:
                             rvol_now = _combined_rvol(df5["volume"], df15["volume"], lk5=64, lk15=64)
                             near_tp = any(abs(price - float(tp)) <= 0.2 * float(atr(df15, 14).iloc[-1]) for tp in sig.tps)
                             if near_tp and rvol_now < 0.9 and _should_alert(sig.id or -1, "latch"):
-                                await bot.send_message(chat_id, f"ℹ️ {sig.symbol.split('/')[0]}: Цена пилит TP при падающем RVOL — подумайте о частичной фиксации.")
+                                await bot.send_message(chat_id, f"ℹ️ {sig.symbol.split('/')[0]}: Цена пилит TP при падающем RVOL — частичная фиксация уместна.")
+                            if df1d is not None and TA_KEY_LEVELS:
+                                kl = _key_levels(df15, None, df1d)
+                                PDH = kl.get("PDH"); PDL = kl.get("PDL")
+                                a = float(atr(df15, 14).iloc[-1])
+                                if PDH and abs(price - PDH) < 0.25 * a and _should_alert(sig.id or -1, "pdh"):
+                                    await bot.send_message(chat_id, f"ℹ️ {sig.symbol.split('/')[0]} у PDH — возможен откат, подумайте о частичной фиксации.")
+                                if PDL and abs(price - PDL) < 0.25 * a and _should_alert(sig.id or -1, "pdl"):
+                                    await bot.send_message(chat_id, f"ℹ️ {sig.symbol.split('/')[0]} у PDL — возможен откат, подумайте о частичной фиксации.")
                     except Exception:
                         pass
 
+                # Обновление трейлинга
                 if sig.tp_hit >= 1 and sig.trailing and now_ts - last_trail_update > 60:
                     await _enhanced_update_trailing(sig)
                     last_trail_update = now_ts
-                    if db: await db.update_signal(sig)
+                    if db:
+                        await db.update_signal(sig)
 
+                # Управление TP/SL
                 if sig.side == "LONG":
+                    # TP1
                     if sig.tp_hit < 1 and price >= sig.tps[0]:
-                        sig.tp_hit = 1; sig.sl = sig.entry; sig.trailing = True; sig.trail_mode = "supertrend"
+                        sig.tp_hit = 1
+                        sig.sl = sig.entry
+                        sig.trailing = True
+                        sig.trail_mode = "supertrend"
                         if MET_TP1: MET_TP1.inc()
-                        await bot.send_message(chat_id, f"✅ TP1 по {sig.symbol.split('/')[0]} ({format_price(price)}). Стоп в БУ ({format_price(sig.sl)}), трейлинг включён.")
-                        if db: await db.update_signal(sig)
+                        await bot.send_message(
+                            chat_id,
+                            f"✅ TP1 по {sig.symbol.split('/')[0]} ({format_price(price)}). "
+                            f"Стоп в БУ ({format_price(sig.sl)}), трейлинг включён."
+                        )
+                        if db:
+                            await db.update_signal(sig)
+                    # TP2
                     if sig.tp_hit < 2 and price >= sig.tps[1]:
                         sig.tp_hit = 2
                         if MET_TP2: MET_TP2.inc()
                         await bot.send_message(chat_id, f"✅ TP2 по {sig.symbol.split('/')[0]} ({format_price(price)}).")
-                        if db: await db.update_signal(sig)
+                        if db:
+                            await db.update_signal(sig)
+                    # TP3 — завершение
                     if sig.tp_hit < 3 and price >= sig.tps[2]:
-                        sig.tp_hit = 3; sig.active = False
+                        sig.tp_hit = 3
+                        sig.active = False
                         if MET_TP3: MET_TP3.inc()
                         await bot.send_message(chat_id, f"🎯 TP3 по {sig.symbol.split('/')[0]} ({format_price(price)}). Сигнал завершён.")
-                        if db: await db.update_signal(sig)
+                        if db:
+                            await db.update_signal(sig)
                         break
+                    # Стоп/БУ
                     if price <= sig.sl:
                         sig.active = False
                         if sig.tp_hit >= 1 and sig.sl >= sig.entry:
@@ -1311,25 +1687,42 @@ def patch(app: Dict[str, Any]) -> None:
                         else:
                             if MET_STOP: MET_STOP.inc()
                             await bot.send_message(chat_id, f"🛑 Стоп по {sig.symbol.split('/')[0]} ({format_price(price)}).")
-                        if db: await db.update_signal(sig)
+                        if db:
+                            await db.update_signal(sig)
                         break
                 else:
+                    # SHORT
+                    # TP1
                     if sig.tp_hit < 1 and price <= sig.tps[0]:
-                        sig.tp_hit = 1; sig.sl = sig.entry; sig.trailing = True; sig.trail_mode = "supertrend"
+                        sig.tp_hit = 1
+                        sig.sl = sig.entry
+                        sig.trailing = True
+                        sig.trail_mode = "supertrend"
                         if MET_TP1: MET_TP1.inc()
-                        await bot.send_message(chat_id, f"✅ TP1 по {sig.symbol.split('/')[0]} ({format_price(price)}). Стоп в БУ ({format_price(sig.sl)}), трейлинг включён.")
-                        if db: await db.update_signal(sig)
+                        await bot.send_message(
+                            chat_id,
+                            f"✅ TP1 по {sig.symbol.split('/')[0]} ({format_price(price)}). "
+                            f"Стоп в БУ ({format_price(sig.sl)}), трейлинг включён."
+                        )
+                        if db:
+                            await db.update_signal(sig)
+                    # TP2
                     if sig.tp_hit < 2 and price <= sig.tps[1]:
                         sig.tp_hit = 2
                         if MET_TP2: MET_TP2.inc()
                         await bot.send_message(chat_id, f"✅ TP2 по {sig.symbol.split('/')[0]} ({format_price(price)}).")
-                        if db: await db.update_signal(sig)
+                        if db:
+                            await db.update_signal(sig)
+                    # TP3 — завершение
                     if sig.tp_hit < 3 and price <= sig.tps[2]:
-                        sig.tp_hit = 3; sig.active = False
+                        sig.tp_hit = 3
+                        sig.active = False
                         if MET_TP3: MET_TP3.inc()
                         await bot.send_message(chat_id, f"🎯 TP3 по {sig.symbol.split('/')[0]} ({format_price(price)}). Сигнал завершён.")
-                        if db: await db.update_signal(sig)
+                        if db:
+                            await db.update_signal(sig)
                         break
+                    # Стоп/БУ
                     if price >= sig.sl:
                         sig.active = False
                         if sig.tp_hit >= 1 and sig.sl <= sig.entry:
@@ -1338,17 +1731,21 @@ def patch(app: Dict[str, Any]) -> None:
                         else:
                             if MET_STOP: MET_STOP.inc()
                             await bot.send_message(chat_id, f"🛑 Стоп по {sig.symbol.split('/')[0]} ({format_price(price)}).")
-                        if db: await db.update_signal(sig)
+                        if db:
+                            await db.update_signal(sig)
                         break
 
                 await asyncio.sleep(10)
 
+            # Завершение по времени
             if now_msk() >= sig.watch_until and sig.active:
                 sig.active = False
                 await bot.send_message(chat_id, f"⏱ Мониторинг по {sig.symbol.split('/')[0]} завершён по времени.")
-                if db: await db.update_signal(sig)
+                if db:
+                    await db.update_signal(sig)
         except Exception:
-            if app.get("MET_WATCH_ERR"): app["MET_WATCH_ERR"].inc()
+            if MET_WATCH_ERR:
+                MET_WATCH_ERR.inc()
             logger and logger.exception("Мониторинг+: ошибка")
             try:
                 await bot.send_message(chat_id, "⚠️ Ошибка мониторинга сигнала.")
@@ -1371,4 +1768,5 @@ def patch(app: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-    logger and logger.info("TA patch Iteration 3 подключён: Orderflow/Derivatives/VolumeProfile/Adaptive/Regimes/ML/BTC.D/Breadth/Alerts.")
+    # Лог об успешном применении обновления
+    logger and logger.info("TA patch Iteration 4 подключён: Regimes/Hurst/KeyLevels/CME/DTW/Bayes/Microstructure + Enhanced Watch.")
