@@ -8,7 +8,10 @@ import ctypes
 import calendar
 import contextlib
 import atexit
+import lock 
 import errno
+import asyncio
+from something import main_patch
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
@@ -2504,7 +2507,22 @@ async def on_startup(bot: Bot):
         logger.info("Новости RSS: OK")
     else:
         logger.warning("Новости RSS: пока недоступны, будет использован кэш/резерв")
+
+    # Новости (как и было)
     asyncio.create_task(news_updater())
+
+    # NEW: ежедневный пост в канал в 08:00 МСК (функция экспортируется из lock.py)
+    try:
+        start_loop = globals().get("start_daily_channel_post_loop")
+        if start_loop:
+            # Можно передать CHANNEL_USERNAME (например, '@NeonFakTrading'), либо оставить None и взять из ENV TG_CHANNEL
+            asyncio.create_task(start_loop(globals(), bot, CHANNEL_USERNAME))
+            logger.info("Daily channel post loop scheduled.")
+        else:
+            logger.info("Daily channel post loop not available (no patch).")
+    except Exception as e:
+        logger.warning("Daily channel loop start failed: %s", e)
+
     try:
         active_sigs = await db.get_all_active_signals()
         for sig in active_sigs:
@@ -2638,25 +2656,34 @@ async def main():
     finally:
         release_lock()
 
-# Опциональная загрузка улучшений TA: через переменную окружения TA_PATCH_MODULE.
-# Если не задано или модуль не найден — тихо пропускаем.
+# Опциональная загрузка улучшений TA: теперь поддерживаются несколько модулей через TA_PATCH_MODULES=mod1,mod2
 try:
-    ta_module = os.getenv("TA_PATCH_MODULE", "").strip()
-    if ta_module:
-        import importlib
-        neon_ta = importlib.import_module(ta_module)
-        if hasattr(neon_ta, "patch"):
-            neon_ta.patch(globals())
-            logger.info("Enhanced TA module loaded from %s.", ta_module)
-        else:
-            logger.warning("TA module %s не содержит patch(), пропускаю.", ta_module)
+    import importlib
+    mods = []
+    env_multi = os.getenv("TA_PATCH_MODULES", "").strip()
+    env_single = os.getenv("TA_PATCH_MODULE", "").strip()
+    if env_multi:
+        mods = [m.strip() for m in env_multi.split(",") if m.strip()]
+    elif env_single:
+        mods = [env_single]
+
+    if mods:
+        for name in mods:
+            try:
+                m = importlib.import_module(name)
+                if hasattr(m, "patch"):
+                    m.patch(globals())
+                    logger.info("TA patch loaded: %s", name)
+                else:
+                    logger.warning("TA module %s не содержит patch(), пропускаю.", name)
+            except ModuleNotFoundError:
+                logger.warning("TA модуль %s не найден.", name)
+            except Exception as e:
+                logger.warning("Ошибка загрузки TA модуля %s: %s", name, e)
     else:
-        # Раньше пытались импортировать main — теперь не делаем этого по умолчанию
-        logger.info("TA_PATCH_MODULE не задан — пропускаю опциональные улучшения TA.")
-except ModuleNotFoundError:
-    logger.warning("TA модуль не найден, улучшения TA пропущены.")
-except Exception as _e:
-    logger.warning("Не удалось загрузить улучшения TA: %s", _e)
+        logger.info("TA_PATCH_MODULE(S) не заданы — пропускаю опциональные улучшения TA.")
+except Exception as e:
+    logger.warning("Не удалось обработать TA_PATCH_MODULE(S): %s", e)
 
 if __name__ == "__main__":
     try:
