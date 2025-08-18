@@ -270,7 +270,7 @@ async def _post_admin_greetings(app: Dict[str, Any], bot) -> None:
     db = app.get("db")
     market = app.get("market")
     now_msk = app["now_msk"]
-    if not (db and getattr(db, "conn", None)):
+    if not (db and db.conn):
         return
     try:
         admin_ids = await db.get_admin_user_ids()
@@ -346,8 +346,7 @@ def _pretty_analysis_header(base: str, side: str, score: Optional[float], p_baye
         conf_txt = f" • уверенность {p_bayes:.2f}"
     elif isinstance(score, (int, float)):
         conf_txt = f" • оценка {score:.2f}"
-    side = side or "-"
-    return f"🔎 Анализ {base} • уклон {side}{conf_txt}"
+    return f"🔎 Анализ {base} • улон {side}{conf_txt}"
 
 def _format_analysis_text(build_reason_fn, fmt_price, details: Dict[str, Any], base: str, side: str, side_score: Optional[float]) -> str:
     try:
@@ -540,7 +539,7 @@ def _session_vwap(df: pd.DataFrame, session: str, bounds: Dict[str, Tuple[dateti
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     pv = (tp[mask] * df["volume"][mask]).sum()
     vv = df["volume"][mask].sum() + 1e-9
-    return float(pv / vv)
+    return pv / vv
 
 def _initial_balance_levels_session(df: pd.DataFrame, session: str, bounds: Dict[str, Tuple[datetime, datetime]], ib_minutes: int = 60) -> Tuple[Optional[float], Optional[float]]:
     mask = _session_mask(df, session, bounds)
@@ -556,8 +555,8 @@ def _session_breakout(df: pd.DataFrame, session: str, bounds: Dict[str, Tuple[da
     if not mask.any(): return 0
     df_sess = df[mask]
     last_close = df_sess["close"].iloc[-1]
-    if last_close > (ib_hi if ib_hi is not None else float("inf")): return 1  # breakout up
-    if last_close < (ib_lo if ib_lo is not None else float("-inf")): return -1  # breakout down
+    if last_close > ib_hi: return 1  # breakout up
+    if last_close < ib_lo: return -1  # breakout down
     return 0  # inside
 
 def _bbwp(series: pd.Series, length: int = 20, lookback: int = 96) -> float:
@@ -565,7 +564,7 @@ def _bbwp(series: pd.Series, length: int = 20, lookback: int = 96) -> float:
     dev = series.rolling(length).std()
     bbw = (series - basis + 2 * dev) / (4 * dev + 1e-12)
     bbwp = bbw.rolling(lookback).rank(pct=True) * 100
-    return float(bbwp.iloc[-1])
+    return bbwp.iloc[-1]
 
 def _daily_pivots(df1d: pd.DataFrame) -> Dict[str, float]:
     if df1d.empty or len(df1d) < 2: return {}
@@ -575,28 +574,26 @@ def _daily_pivots(df1d: pd.DataFrame) -> Dict[str, float]:
     S1 = 2 * P - prev["high"]
     R2 = P + (prev["high"] - prev["low"])
     S2 = P - (prev["high"] - prev["low"])
-    return {"P": float(P), "R1": float(R1), "R2": float(R2), "S1": float(S1), "S2": float(S2)}
+    return {"P": P, "R1": R1, "R2": R2, "S1": S1, "S2": S2}
 
 def _near_round_level(price: float, step: float = 0.25) -> Tuple[float, float]:
     base = math.floor(price / step) * step
     dist = price - base
-    lvl = base if dist < step / 2 else base + step
-    return float(lvl), float(dist / step)
+    return base if dist < step / 2 else base + step, dist / step
 
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def _rsi(series: pd.Series, period: int = 14) -> float:
     delta = series.diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
     loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / (loss.replace(0, np.nan))
-    out = 100 - 100 / (1 + rs)
-    return out
+    rs = gain / loss
+    return 100 - 100 / (1 + rs)
 
 def _rsi_map(df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Dict[str, float]:
     return {
-        "5m": float(_rsi(df5["close"], 14).iloc[-1]) if df5 is not None and not df5.empty else 50.0,
-        "15m": float(_rsi(df15["close"], 14).iloc[-1]) if df15 is not None and not df15.empty else 50.0,
-        "1h": float(_rsi(df1h["close"], 14).iloc[-1]) if df1h is not None and not df1h.empty else 50.0,
-        "4h": float(_rsi(df4h["close"], 14).iloc[-1]) if df4h is not None and not df4h.empty else 50.0,
+        "5m": _rsi(df5["close"], 14).iloc[-1] if df5 is not None and not df5.empty else 50.0,
+        "15m": _rsi(df15["close"], 14).iloc[-1] if df15 is not None and not df15.empty else 50.0,
+        "1h": _rsi(df1h["close"], 14).iloc[-1] if df1h is not None and not df1h.empty else 50.0,
+        "4h": _rsi(df4h["close"], 14).iloc[-1] if df4h is not None and not df4h.empty else 50.0,
     }
 
 def _rsi_consensus(rsi_map: Dict[str, float], side: str) -> int:
@@ -615,37 +612,22 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 def _ha_run_exhaustion(ha: pd.DataFrame) -> Tuple[int, bool]:
     direction = np.sign(ha["close"] - ha["open"])
     run = 0
-    prev_d = 0
     for d in direction.iloc[::-1]:
-        if d == 0:
-            break
+        if d == 0: break
         if run == 0 or d == prev_d:
             run += 1
         else:
             break
         prev_d = d
-    # Если не было ни одного бара с направлением — prev_d останется 0
-    if prev_d == 0:
-        exhaustion = True
-        return 0, exhaustion
-    hl_range = float(ha["high"].iloc[-1] - ha["low"].iloc[-1])
-    body = float(abs(ha["close"].iloc[-1] - ha["open"].iloc[-1]))
-    exhaustion = (hl_range > 0) and (body < 0.3 * hl_range)  # doji-like
+    exhaustion = (abs(ha["close"].iloc[-1] - ha["open"].iloc[-1]) < 0.3 * (ha["high"].iloc[-1] - ha["low"].iloc[-1]))  # doji-like
     return int(run * prev_d), exhaustion
 
-def _ema_ribbon(df: pd.DataFrame, periods: List[int] = [8, 13, 21, 34]) -> float:
+def _ema_ribbon(df: pd.DataFrame, periods: List[int] = [8,13,21,34]) -> float:
     emas = [df["close"].ewm(span=p, adjust=False).mean() for p in periods]
-    mat = pd.concat(emas, axis=1)
-    rib = mat.max(axis=1) - mat.min(axis=1)
-    rib_last = float(rib.iloc[-1])
-    price = float(df["close"].iloc[-1])
-    if price == 0:
-        return 0.0
-    return rib_last / price  # normalized width
+    ribbon_w = max(emas) - min(emas)
+    return ribbon_w / df["close"].iloc[-1]  # normalized width
 
 def _ribbon_state(ribbon_w: float, atr: float) -> str:
-    if atr <= 0:
-        return "neutral"
     if ribbon_w < 0.5 * atr: return "compressed"
     if ribbon_w > 1.5 * atr: return "expanded"
     return "neutral"
@@ -653,24 +635,24 @@ def _ribbon_state(ribbon_w: float, atr: float) -> str:
 def _swing_points(df: pd.DataFrame, lookback: int = 5) -> Tuple[float, float]:
     hi = df["high"].rolling(lookback).max().shift(1)
     lo = df["low"].rolling(lookback).min().shift(1)
-    return float(hi.iloc[-1]), float(lo.iloc[-1])
+    return hi.iloc[-1], lo.iloc[-1]
 
 def _fib_levels(high: float, low: float) -> Dict[float, float]:
     diff = high - low
     return {
-        0.382: float(high - 0.382 * diff),
-        0.5: float(high - 0.5 * diff),
-        0.618: float(high - 0.618 * diff),
-        1.272: float(high + 0.272 * diff),
-        1.618: float(high + 0.618 * diff),
+        0.382: high - 0.382 * diff,
+        0.5: high - 0.5 * diff,
+        0.618: high - 0.618 * diff,
+        1.272: high + 0.272 * diff,
+        1.618: high + 0.618 * diff,
     }
 
 def _day_type(df15: pd.DataFrame, ib_hi: float, ib_lo: float) -> str:
-    close = float(df15["close"].iloc[-1])
-    open_day = float(df15["open"].iloc[0])
-    if (ib_hi is not None) and close > ib_hi and open_day < ib_hi: return "Open-Drive Up"
-    if (ib_lo is not None) and close < ib_lo and open_day > ib_lo: return "Open-Drive Down"
-    if (ib_hi is not None) and (ib_lo is not None) and abs(close - open_day) < (ib_hi - ib_lo): return "Balanced"
+    close = df15["close"].iloc[-1]
+    open_day = df15["open"].iloc[0]
+    if close > ib_hi and open_day < ib_hi: return "Open-Drive Up"
+    if close < ib_lo and open_day > ib_lo: return "Open-Drive Down"
+    if abs(close - open_day) < (ib_hi - ib_lo): return "Balanced"
     return "ORR"  # Open Range Reversal
 
 # Env-флаги и веса (примерные дефолты)
@@ -716,7 +698,6 @@ def patch(app: Dict[str, Any]) -> None:
     app["vix_fix"] = vix_fix
     app["tsf_slope"] = tsf_slope
     app["start_daily_channel_post_loop"] = start_daily_channel_post_loop
-    app["start_daily_admin_greetings_loop"] = start_daily_admin_greetings_loop
 
     # ---------- TZ-safe overrides ----------
     def _anchored_vwap_safe(df: pd.DataFrame, anchor: Optional[datetime] = None) -> pd.Series:
@@ -901,7 +882,7 @@ def patch(app: Dict[str, Any]) -> None:
             rsi5 = details.get("rsi5"); macdh5 = details.get("macdh5")
             mom = f"RSI(5m) {rsi5:.0f}, MACD {'+' if (macdh5 or 0) > 0 else '-'}" if rsi5 is not None else f"MACD {'+' if (macdh5 or 0) > 0 else '-'}"
 
-            adx15 = details.get("adx15", 0); r2 = details.get("r2_1h", 0.0)
+            adx15 = details.get("adx15"); r2 = details.get("r2_1h")
             st_dir = details.get("st_dir"); st_txt = "ST ↑" if st_dir and st_dir > 0 else "ST ↓"
             bos_dir = details.get("bos_dir"); bos_txt = "BOS↑" if bos_dir == 1 else ("BOS↓" if bos_dir == -1 else "")
             bos_txt = bos_txt + ("+retest" if details.get("bos_retest") else "")
@@ -930,10 +911,9 @@ def patch(app: Dict[str, Any]) -> None:
             # Новые поля для reason
             session = details.get("session", "N/A")
             ib_hi = details.get("ib_hi"); ib_lo = details.get("ib_lo")
-            ib_txt = f"Сессия IB: {fmt_price(ib_hi)}/{fmt_price(ib_lo)}" if (ib_hi is not None and ib_lo is not None) else ""
+            ib_txt = f"Сессия: {fmt_price(ib_hi)}/{fmt_price(ib_lo)}" if ib_hi and ib_lo else ""
             bbwp = details.get("bbwp", 50); bbwp_txt = f"BBWP {bbwp:.0f}%"
-            pivots = details.get("pivots", {}); 
-            piv_txt = f"P {fmt_price(pivots.get('P'))}, R1 {fmt_price(pivots.get('R1'))}, S1 {fmt_price(pivots.get('S1'))}" if pivots else ""
+            pivots = details.get("pivots", {}); piv_txt = f"P {fmt_price(pivots.get('P'))}, R1 {fmt_price(pivots.get('R1'))}, S1 {fmt_price(pivots.get('S1'))}" if pivots else ""
             round_level = details.get("round_level"); round_txt = f"Round: {fmt_price(round_level)}" if round_level else ""
             rsi_map = details.get("rsi_map", {}); rsi_cons = _rsi_consensus(rsi_map, side); rsi_txt = f"RSI stack: {rsi_cons}/4"
             ha_run = details.get("ha_run", 0); ha_txt = f"HA run: {ha_run}"
@@ -944,22 +924,22 @@ def patch(app: Dict[str, Any]) -> None:
             lines.append(f"Сторона: {side} • Риск-L {risk_level}/10 • Плечо {lev}x")
             lines.append(f"Тренд MTF: {t4h}, {t1h}, {t15}")
             lines.append(f"Моментум: {mom}")
-            lines.append(f"Режим: ADX {adx15:.0f} • R2(1h) {float(r2):.2f} • ATR(15m)≈{atr:.4f} ({atr_pct:.2f}%)")
+            lines.append(f"Режим: ADX {adx15:.0f} • R2(1h) {r2:.2f} • ATR(15m)≈{atr:.4f} ({atr_pct:.2f}%)")
             setup_bits = " • ".join([x for x in [st_txt, bos_txt, don, vwap_conf] if x])
             if setup_bits:
                 lines.append(f"Сетапы: {setup_bits}")
             lines.append(f"Управление риском: SL {fmt_price(sl)} ({risk_pct:.2f}% от входа) • {tp_txt}")
             micro_bits = []
-            if vol_z is not None: micro_bits.append(f"vol_z {float(vol_z):.2f}")
-            if rvol is not None: micro_bits.append(f"RVOL x{float(rvol):.2f}")
-            if cvd is not None: micro_bits.append(f"CVD {float(cvd):+0.0f}")
-            if ob_imb is not None: micro_bits.append(f"L2-imb {float(ob_imb):+0.2f}")
-            if basis is not None: micro_bits.append(f"basis {float(basis)*100:+.2f}%")
+            if vol_z is not None: micro_bits.append(f"vol_z {vol_z:.2f}")
+            if rvol is not None: micro_bits.append(f"RVOL x{rvol:.2f}")
+            if cvd is not None: micro_bits.append(f"CVD {cvd:+.0f}")
+            if ob_imb is not None: micro_bits.append(f"L2-imb {ob_imb:+.2f}")
+            if basis is not None: micro_bits.append(f"basis {basis*100:+.2f}%")
             if dom_tr: micro_bits.append(f"BTC.D {dom_tr}")
             if micro_bits:
                 lines.append("Потоки/объём: " + ", ".join(micro_bits))
             if nb is not None:
-                lines.append(f"Новости: +{float(nb):.2f}")
+                lines.append(f"Новости: +{nb:.2f}")
             if topf:
                 lines.append("Топ-факторы: " + topf)
             lines.append("Окно сделки: ~40м–6ч")
@@ -1000,8 +980,8 @@ def patch(app: Dict[str, Any]) -> None:
     # ---------- Патч /code: спросить город ----------
     def _patch_cmd_code():
         try:
-            obs = router.message if router else None
-            handlers = getattr(obs, "handlers", []) if obs else []
+            obs = router.message
+            handlers = getattr(obs, "handlers", [])
             target = None
             for h in handlers:
                 cb = getattr(h, "callback", None)
@@ -1034,15 +1014,15 @@ def patch(app: Dict[str, Any]) -> None:
             score_symbol_quick = app.get("score_symbol_quick")
             guard_access = app.get("guard_access")
             format_signal_message = app.get("format_signal_message")
-            edit_retry_html = app.get("edit_retry_html") or (lambda msg, text: msg.edit_text(text))
+            edit_retry_html = app.get("edit_retry_html")
             now_msk = app["now_msk"]
             Signal = app.get("Signal")
             MET_SIGNALS_GEN = app.get("MET_SIGNALS_GEN", None)
             active_watch_tasks = app.get("active_watch_tasks", {})
             SYMBOLS = app.get("SYMBOLS", [])
 
-            obs = router.message if router else None
-            handlers = getattr(obs, "handlers", []) if obs else []
+            obs = router.message
+            handlers = getattr(obs, "handlers", [])
             target = None
             for h in handlers:
                 cb = getattr(h, "callback", None)
@@ -1088,7 +1068,7 @@ def patch(app: Dict[str, Any]) -> None:
                     symbol, details = picked
                     side = details["side"]; entry = details["c5"]; sl = details["sl"]; tps = details["tps"]
                     leverage = details["leverage"]; risk_level = details["risk_level"]
-                    news_note = details.get("news_note"); atr_value = details.get("atr"); watch_seconds = details.get("watch_seconds", 4 * 3600)
+                    news_note = details["news_note"]; atr_value = details["atr"]; watch_seconds = details["watch_seconds"]
                     reason = app["build_reason"](details)
 
                     if side == "LONG":
@@ -1135,8 +1115,8 @@ def patch(app: Dict[str, Any]) -> None:
             resolve_symbol_from_query = app.get("resolve_symbol_from_query")
             db = app.get("db")
 
-            obs = router.message if router else None
-            handlers = getattr(obs, "handlers", []) if obs else []
+            obs = router.message
+            handlers = getattr(obs, "handlers", [])
             target = None
             for h in handlers:
                 cb = getattr(h, "callback", None)
@@ -1181,7 +1161,7 @@ def patch(app: Dict[str, Any]) -> None:
                         q = parts[1].strip()
                         sym = None
                         with contextlib.suppress(Exception):
-                            sym = resolve_symbol_from_query(q) if resolve_symbol_from_query else None
+                            sym = resolve_symbol_from_query(q)
                         if not sym:
                             sym = _resolve_symbol_any(app, q)
                         if not sym:
@@ -1200,7 +1180,7 @@ def patch(app: Dict[str, Any]) -> None:
                     if not st: return
                     sym = None
                     with contextlib.suppress(Exception):
-                        sym = resolve_symbol_from_query(text) if resolve_symbol_from_query else None
+                        sym = resolve_symbol_from_query(text)
                     if not sym:
                         sym = _resolve_symbol_any(app, text)
                     if not sym:
@@ -1223,7 +1203,7 @@ def patch(app: Dict[str, Any]) -> None:
     if orig_score:
         def _score_plus(symbol: str, relax: bool = False):
             base = orig_score(symbol, relax)
-            if base is None:
+            if base is None: 
                 logger and logger.warning(f"Score plus skipped for {symbol}: base score is None")
                 return None
             score, side, d = base
@@ -1233,14 +1213,13 @@ def patch(app: Dict[str, Any]) -> None:
             try:
                 # Предполагаем, что в d есть df5, df15, df1h, df4h, df1d, close= d["c5"], atr=d["atr"]
                 df5 = d.get("df5"); df15 = d.get("df15"); df1h = d.get("df1h"); df4h = d.get("df4h"); df1d = d.get("df1d")
-                close = float(d.get("c5", 0) or 0)
-                atr = float(d.get("atr", 0) or 0)
+                close = float(d.get("c5", 0))
+                atr = float(d.get("atr", 0))
                 now_utc = datetime.now(timezone.utc)
 
                 # Проверка валидности данных
                 if df15 is None or df15.empty:
                     logger and logger.warning(f"Score plus for {symbol}: df15 is None or empty, skipping TA")
-                    d["score_breakdown"] = breakdown
                     return base
 
                 # 1) BBWP
@@ -1271,9 +1250,9 @@ def patch(app: Dict[str, Any]) -> None:
                         for s in ["ASIA", "EU", "US"]:
                             vwaps[s] = _session_vwap(df15, s, bounds)
                         d["vwaps"] = vwaps
-                        breakout = _session_breakout(df15, session, bounds, close, ib_hi, ib_lo)
+                        breakout = _session_breakout(df15, session, bounds, close, ib_hi or 0, ib_lo or 0)
                         d["session_breakout"] = breakout
-                        dist_to_ib = min(abs(close - (ib_hi if ib_hi is not None else close)), abs(close - (ib_lo if ib_lo is not None else close))) / atr if atr > 0 else 0
+                        dist_to_ib = min(abs(close - (ib_hi or close)), abs(close - (ib_lo or close))) / atr if atr > 0 else 0
                         if breakout * (1 if side == "LONG" else -1) > 0:
                             breakdown["Session"] = breakdown.get("Session", 0) + W_SESSION
                         elif dist_to_ib < 0.3:
@@ -1287,7 +1266,7 @@ def patch(app: Dict[str, Any]) -> None:
                     try:
                         pivots = _daily_pivots(df1d)
                         d["pivots"] = pivots
-                        levels = [pivots.get(k) for k in ["R1", "R2", "S1", "S2"] if pivots.get(k) is not None]
+                        levels = [pivots.get(k) for k in ["R1", "R2", "S1", "S2"] if pivots.get(k)]
                         if levels:
                             closest = min(levels, key=lambda lv: abs(close - lv))
                             dist = abs(close - closest) / atr if atr > 0 else 0
@@ -1366,48 +1345,19 @@ def patch(app: Dict[str, Any]) -> None:
                         swing_hi4h, swing_lo4h = _swing_points(df4h)
                         fib4h = _fib_levels(swing_hi4h, swing_lo4h)
                         d["fib"] = {**{f"1h_{k}": v for k, v in fib1h.items()}, **{f"4h_{k}": v for k, v in fib4h.items()}}
-                        logger and logger.info("Fib levels calculated for 1h/4h")
+                        logger and logger.info(f"Fib levels calculated for 1h/4h")
                     except Exception as e:
                         logger and logger.warning(f"Fib levels failed for {symbol}: {e}")
 
                 # 9) Day type
-                if TA_DAYTYPE and df15 is not None and not df15.empty and ("ib_hi" in d) and ("ib_lo" in d):
+                if TA_DAYTYPE and df15 is not None and not df15.empty and "ib_hi" in d:
                     try:
                         day_type = _day_type(df15, d["ib_hi"], d["ib_lo"])
                         d["day_type"] = day_type
-                        if "Open-Drive" in day_type and (("Up" in day_type and side == "LONG") or ("Down" in day_type and side == "SHORT")):
+                        if "Open-Drive" in day_type and ("Up" if side == "LONG" else "Down") in day_type:
                             breakdown["DayType"] = breakdown.get("DayType", 0) + W_DAYTYPE
                         elif "Balanced" in day_type:
                             breakdown["DayType"] = breakdown.get("DayType", 0) - W_DAYTYPE * 0.5
                         logger and logger.info(f"Day type {day_type}, adjustment {breakdown.get('DayType')}")
                     except Exception as e:
                         logger and logger.warning(f"Day type calculation failed for {symbol}: {e}")
-
-            except Exception as e:
-                logger and logger.warning(f"Score plus extra TA failed for {symbol}: {e}")
-
-            d["score_breakdown"] = breakdown
-            adj = sum(v for v in breakdown.values() if isinstance(v, (int, float, np.floating)))
-            final_score = float(score) + float(adj)
-            return final_score, side, d
-
-        app["score_symbol_core"] = _score_plus
-
-    # Пропатчить обработчики
-    _patch_cmd_code()
-    _patch_cmd_signal()
-    _patch_fallback()
-
-    # on_startup: обеспечить колонку city
-    async def _on_startup_patched(*args, **kwargs):
-        db = app.get("db")
-        if db and getattr(db, "conn", None):
-            with contextlib.suppress(Exception):
-                await _ensure_city_column(db)
-        if callable(orig_on_startup):
-            return await orig_on_startup(*args, **kwargs)
-        return None
-
-    app["on_startup"] = _on_startup_patched
-
-    logger and logger.info("Patch applied successfully.")
