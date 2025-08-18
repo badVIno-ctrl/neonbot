@@ -346,7 +346,7 @@ def _pretty_analysis_header(base: str, side: str, score: Optional[float], p_baye
         conf_txt = f" • уверенность {p_bayes:.2f}"
     elif isinstance(score, (int, float)):
         conf_txt = f" • оценка {score:.2f}"
-    return f"🔎 Анализ {base} • улон {side}{conf_txt}"
+    return f"🔎 Анализ {base} • направление {side}{conf_txt}"
 
 def _format_analysis_text(build_reason_fn, fmt_price, details: Dict[str, Any], base: str, side: str, side_score: Optional[float]) -> str:
     try:
@@ -579,13 +579,13 @@ def _daily_pivots(df1d: pd.DataFrame) -> Dict[str, float]:
 def _near_round_level(price: float, step: float = 0.25) -> Tuple[float, float]:
     base = math.floor(price / step) * step
     dist = price - base
-    return base if dist < step / 2 else base + step, dist / step
+    return (base if dist < step / 2 else base + step), dist / step
 
-def _rsi(series: pd.Series, period: int = 14) -> float:
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.where(delta > 0, 0).rolling(period).mean()
     loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / loss
+    rs = gain / (loss + 1e-12)
     return 100 - 100 / (1 + rs)
 
 def _rsi_map(df5: pd.DataFrame, df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Dict[str, float]:
@@ -612,20 +612,26 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 def _ha_run_exhaustion(ha: pd.DataFrame) -> Tuple[int, bool]:
     direction = np.sign(ha["close"] - ha["open"])
     run = 0
+    prev_d = None
     for d in direction.iloc[::-1]:
-        if d == 0: break
-        if run == 0 or d == prev_d:
+        if d == 0:
+            break
+        if prev_d is None or d == prev_d:
             run += 1
         else:
             break
         prev_d = d
-    exhaustion = (abs(ha["close"].iloc[-1] - ha["open"].iloc[-1]) < 0.3 * (ha["high"].iloc[-1] - ha["low"].iloc[-1]))  # doji-like
-    return int(run * prev_d), exhaustion
+    signed_run = 0 if prev_d is None else int(run * prev_d)
+    last_range = float(ha["high"].iloc[-1] - ha["low"].iloc[-1])
+    body = float(abs(ha["close"].iloc[-1] - ha["open"].iloc[-1]))
+    exhaustion = (last_range > 0) and (body < 0.3 * last_range)
+    return signed_run, exhaustion
 
 def _ema_ribbon(df: pd.DataFrame, periods: List[int] = [8,13,21,34]) -> float:
     emas = [df["close"].ewm(span=p, adjust=False).mean() for p in periods]
-    ribbon_w = max(emas) - min(emas)
-    return ribbon_w / df["close"].iloc[-1]  # normalized width
+    r = pd.concat(emas, axis=1)
+    width = (r.max(axis=1) - r.min(axis=1)).iloc[-1]
+    return float(width)  # absolute width in price units
 
 def _ribbon_state(ribbon_w: float, atr: float) -> str:
     if ribbon_w < 0.5 * atr: return "compressed"
@@ -635,7 +641,7 @@ def _ribbon_state(ribbon_w: float, atr: float) -> str:
 def _swing_points(df: pd.DataFrame, lookback: int = 5) -> Tuple[float, float]:
     hi = df["high"].rolling(lookback).max().shift(1)
     lo = df["low"].rolling(lookback).min().shift(1)
-    return hi.iloc[-1], lo.iloc[-1]
+    return float(hi.iloc[-1]), float(lo.iloc[-1])
 
 def _fib_levels(high: float, low: float) -> Dict[float, float]:
     diff = high - low
@@ -698,6 +704,7 @@ def patch(app: Dict[str, Any]) -> None:
     app["vix_fix"] = vix_fix
     app["tsf_slope"] = tsf_slope
     app["start_daily_channel_post_loop"] = start_daily_channel_post_loop
+    app["start_daily_admin_greetings_loop"] = start_daily_admin_greetings_loop
 
     # ---------- TZ-safe overrides ----------
     def _anchored_vwap_safe(df: pd.DataFrame, anchor: Optional[datetime] = None) -> pd.Series:
@@ -1203,7 +1210,7 @@ def patch(app: Dict[str, Any]) -> None:
     if orig_score:
         def _score_plus(symbol: str, relax: bool = False):
             base = orig_score(symbol, relax)
-            if base is None: 
+            if base is None:
                 logger and logger.warning(f"Score plus skipped for {symbol}: base score is None")
                 return None
             score, side, d = base
@@ -1220,6 +1227,7 @@ def patch(app: Dict[str, Any]) -> None:
                 # Проверка валидности данных
                 if df15 is None or df15.empty:
                     logger and logger.warning(f"Score plus for {symbol}: df15 is None or empty, skipping TA")
+                    d["score_breakdown"] = breakdown
                     return base
 
                 # 1) BBWP
@@ -1361,3 +1369,40 @@ def patch(app: Dict[str, Any]) -> None:
                         logger and logger.info(f"Day type {day_type}, adjustment {breakdown.get('DayType')}")
                     except Exception as e:
                         logger and logger.warning(f"Day type calculation failed for {symbol}: {e}")
+
+                # 10) finalize
+                d["score_breakdown"] = breakdown
+                try:
+                    adj = float(sum(breakdown.values())) if breakdown else 0.0
+                except Exception:
+                    adj = 0.0
+                score2 = float(score) + adj
+                d["score"] = score2
+                return score2, side, d
+            except Exception as e:
+                logger and logger.warning(f"Score plus overall failed for {symbol}: {e}")
+                return base
+
+        app["score_symbol_core"] = _score_plus
+
+    # Включаем патчи хендлеров
+    _patch_cmd_code()
+    _patch_cmd_signal()
+    _patch_fallback()
+
+    # Обновляем on_startup для поддержки новых фич (опционально)
+    async def _on_startup_patched(bot):
+        # ensure city column exists
+        with contextlib.suppress(Exception):
+            if app.get("db"):
+                await _ensure_city_column(app["db"])
+        # запустить фоновые утренние рассылки, если нужно
+        with contextlib.suppress(Exception):
+            asyncio.create_task(start_daily_channel_post_loop(app, bot))
+        with contextlib.suppress(Exception):
+            asyncio.create_task(start_daily_admin_greetings_loop(app, bot))
+        # вызвать оригинальный on_startup
+        if orig_on_startup:
+            await orig_on_startup(bot)
+
+    app["on_startup"] = _on_startup_patched
