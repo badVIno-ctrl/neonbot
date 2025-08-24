@@ -497,7 +497,9 @@ async def on_group_message(app, message: Message, bot):
         return
     # Регистрируем чат для отчётности
     with contextlib.suppress(Exception):
-        await _register_chat(app.get("db"), message.chat.id, getattr(message.chat, "title", ""))
+        db = app.get("db")
+        if db and db.conn:
+            await _register_chat(db, message.chat.id, getattr(message.chat, "title", ""))
 
     # Пропускаем ботов
     if message.from_user.is_bot:
@@ -550,7 +552,9 @@ async def on_member_update(app, upd: ChatMemberUpdated):
             new = getattr(upd, "new_chat_member", None)
             if old and new and getattr(old, "status", None) in ("left", "kicked") and getattr(new, "status", None) == "member":
                 bot = app.get("bot_instance")
-                await _register_chat(app.get("db"), upd.chat.id, getattr(upd.chat, "title", ""))
+                db = app.get("db")
+                if db and db.conn:
+                    await _register_chat(db, upd.chat.id, getattr(upd.chat, "title", ""))
                 # Hold/капча
                 if NEWUSER_CAPTCHA:
                     perms = ChatPermissions(
@@ -817,22 +821,34 @@ async def cmd_warns(app, message: Message, bot):
 
 # ====================== Guard access patch (commands in groups) + лимит-подсказка ======================
 def _patch_guard_access_for_groups(app):
-    orig_guard = app.get("guard_access"); db = app.get("db"); logger = app.get("logger")
+    orig_guard = app.get("guard_access")
+    logger = app.get("logger")
     DAILY_LIMIT = app.get("DAILY_LIMIT", 3)
+
     async def guard_access_patched(message: Message, bot):
-        st = None
+        # Группы: разрешаем команды без подписки, но работаем только если БД готова
         if _is_group(message) and ALLOW_CHAT_COMMANDS_WITHOUT_SUB:
+            db = app.get("db")
+            if not db or not getattr(db, "conn", None):
+                # БД ещё не готова — мягко выходим
+                return None
             st = await db.get_user_state(message.from_user.id)
             # подсказка остатка для /signal
             txt = (message.text or "").strip().lower()
             if txt.startswith("/signal") or "получить сигнал" in txt or "📈" in txt:
                 left = max(0, int(DAILY_LIMIT) - int(st.get("count", 0)))
                 with contextlib.suppress(Exception):
-                    await bot.send_message(message.chat.id, f"ℹ️ Осталось сигналов сегодня: {left}/{DAILY_LIMIT}", message_thread_id=getattr(message, "message_thread_id", None))
+                    await bot.send_message(
+                        message.chat.id,
+                        f"ℹ️ Осталось сигналов сегодня: {left}/{DAILY_LIMIT}",
+                        message_thread_id=getattr(message, "message_thread_id", None)
+                    )
             return st
+        # Прочие случаи — оригинальная защита
         return await orig_guard(message, bot)
+
     app["guard_access"] = guard_access_patched
-    logger and logger.info("Guard access patched: group commands allowed without subscription, limit tips enabled.")
+    logger and logger.info("Guard access patched: group commands allowed without subscription, limit tips enabled (DB dynamic).")
 
 # ====================== TA utilities (inside chat.py) ======================
 def _volume_profile(values_price: List[float], values_vol: List[float], bins: int = 40) -> Optional[Tuple[float,float,float]]:
@@ -1565,7 +1581,6 @@ def patch(app: Dict[str, Any]) -> None:
     # Перехват /signal: per-user lock + daily limit + recent anti-dup
     def _patch_cmd_signal():
         try:
-            db = app.get("db")
             rank_symbols_async = app.get("rank_symbols_async")
             score_symbol_quick = app.get("score_symbol_quick")
             guard_access = app.get("guard_access")
@@ -1601,6 +1616,12 @@ def patch(app: Dict[str, Any]) -> None:
                         return
 
                     # Enforce daily limit
+                    db = app.get("db")
+                    if not db or not getattr(db, "conn", None):
+                        with contextlib.suppress(Exception):
+                            await message.answer("Сервис БД недоступен. Попробуйте чуть позже.")
+                        return
+
                     unlimited = bool(st.get("unlimited")) or bool(st.get("admin"))
                     if not unlimited and int(st.get("count", 0)) >= int(DAILY_LIMIT):
                         with contextlib.suppress(Exception):
@@ -1616,6 +1637,7 @@ def patch(app: Dict[str, Any]) -> None:
                             return
 
                         existing = await db.get_active_signals_for_user(user_id)
+
                         def is_active_dup(sym: str, side: str) -> bool:
                             return any(s.symbol == sym and s.side == side and s.active for s in existing)
 
@@ -1715,7 +1737,7 @@ def patch(app: Dict[str, Any]) -> None:
                             await edit_retry_html(working_msg, "⚠️ Произошла ошибка при поиске сигнала.")
 
             setattr(target, "callback", cmd_signal_patched)
-            logger and logger.info("Signal handler patched: per-user lock + daily limit + recent anti-dup + sanity filter enabled.")
+            logger and logger.info("Signal handler patched: per-user lock + daily limit + recent anti-dup + sanity filter enabled (DB dynamic).")
         except Exception as e:
             logger and logger.warning("Signal handler patch error: %s", e)
 
@@ -1781,4 +1803,4 @@ def patch(app: Dict[str, Any]) -> None:
     router.message.register(_h_unban, F.chat.type.in_({"group","supergroup"}), F.text.startswith("/unban"))
     router.message.register(_h_warns, F.chat.type.in_({"group","supergroup"}), F.text.startswith("/warns"))
 
-    logger and logger.info("chat.py patch applied: moderation + autocomment + CAPTCHA + report buttons + TA booster + warn-decay + limit tips + signal anti-dup + admin greetings 06:00 MSK.")
+    logger and logger.info("chat.py patch applied: moderation + autocomment + CAPTCHA + report buttons + TA booster + warn-decay + limit tips + signal anti-dup + admin greetings 06:00 MSK (DB dynamic).")
