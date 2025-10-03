@@ -1,3 +1,4 @@
+# tacoin.py
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import os
@@ -60,7 +61,7 @@ TAC_TPB_AUTO    = _env_bool("TAC_TPB_AUTO", "1")      # авто-исправл�
 TAC_TPB_FORCE   = _env_bool("TAC_TPB_FORCE", "0")     # всегда перестраивать TP/SL
 TAC_TP_LADDER   = _env_list_float("TAC_TP_LADDER", "0.7,1.6,2.6")  # умолчание для обычных
 TAC_TP_LADDER_MEME = _env_list_float("TAC_TP_LADDER_MEME", "0.6,1.2,2.0")
-TAC_TP_MAX_PCT  = _env_float("TAC_TP_MAX_PCT", 0.20)  # максимум растяжки от входа в %
+TAC_TP_MAX_PCT  = _env_float("TAC_TP_MAX_PCT", 0.25)  # максимум растяжки от входа в %
 TAC_SAFE_DECIMALS_MIN = _env_int("TAC_SAFE_DECIMALS_MIN", 6)
 TAC_SAFE_DECIMALS_MAX = _env_int("TAC_SAFE_DECIMALS_MAX", 8)
 
@@ -562,7 +563,6 @@ def _compute_ta_bundle(app: Dict[str, Any], symbol: str, side: Optional[str]) ->
     bundle: Dict[str, Any] = {}
     t0 = _now_utc().timestamp()
     try:
-        # сначала попытка взять уже загруженные df из кеша MarketClient
         df5  = market.fetch_ohlcv(symbol, "5m", 700)
         df15 = market.fetch_ohlcv(symbol, "15m", 500)
         df1h = market.fetch_ohlcv(symbol, "1h", 420)
@@ -815,9 +815,9 @@ def _tp_sl_builder(app: Dict[str, Any],
     # шаг цены
     safe_tick = _infer_safe_tick(entry, df15)
     tick = float(min(tick_real or safe_tick, safe_tick))
-    # min/max риск к SL (в связке с chat.py)
-    min_risk_atr = float(app.get("TA_SAN_SL_MIN_ATR", 0.25))
-    max_risk_atr = float(app.get("TA_SAN_SL_MAX_ATR", 5.0))
+    # min/max риск к SL (повторяем логику chat.py, но мягко)
+    min_risk_atr = app.get("TA_SAN_SL_MIN_ATR", 0.25)
+    max_risk_atr = app.get("TA_SAN_SL_MAX_ATR", 5.0)
     min_risk = float(min_risk_atr) * float(atr)
     max_risk = float(max_risk_atr) * float(atr)
 
@@ -865,12 +865,14 @@ def _tp_sl_builder(app: Dict[str, Any],
         pass
 
     def snap_one(t: float, side: str) -> float:
+        # кандидатные уровни
         cands: List[float] = _round_levels_near(t)
         if poc: cands.append(float(poc))
         if vah: cands.append(float(vah))
         if val: cands.append(float(val))
         if ib_hi: cands.append(float(ib_hi))
         if ib_lo: cands.append(float(ib_lo))
+        # выбрать ближайший по направлению (не ухудшая монотонность далее)
         if side == "LONG":
             cands = [x for x in cands if x > entry]
             if not cands: return t
@@ -903,6 +905,7 @@ def _tp_sl_builder(app: Dict[str, Any],
         return v <= 0 or (entry < 0.5 and abs(v - 1.0) < 1e-12)
     if any(_is_bad(v) for v in final):
         if prom_c.get("TA_TP_ZERO"): prom_c["TA_TP_ZERO"].inc()
+        # отступим от крайностей безопасным шагом
         final = [max(v, tick*5) for v in final]
 
     # одинаковые TP после округления — раздвинуть на min_step
@@ -910,7 +913,7 @@ def _tp_sl_builder(app: Dict[str, Any],
         if prom_c.get("TA_TP_EQUAL"): prom_c["TA_TP_EQUAL"].inc()
         final = _ensure_tp_monotonic_with_step(side, entry, final, atr, tick, float(app.get("TA_SAN_TP_MIN_STEP_ATR", 0.15)))
 
-    # кап по % от entry
+    # кап по % от entry (защита от «1.000000»)
     def pct_cap(v: float) -> float:
         if side == "LONG":
             return min(v, entry * (1.0 + tp_max_pct))
@@ -1141,7 +1144,7 @@ def patch(app: Dict[str, Any]) -> None:
                 d["score_breakdown"] = {**(d.get("score_breakdown", {}) or {}), **delta}
                 score = float(score) + float(adj)
 
-            # TP/SL builder (фиксация дубликатов/нулей/«1.000000»)
+            # TP/SL builder (фиксация дубликатов/нулей/«1.000000» и т.п.)
             if TAC_TPB_ENABLE:
                 try:
                     entry = float(d.get("c5"))
@@ -1154,7 +1157,7 @@ def patch(app: Dict[str, Any]) -> None:
                         tick_real = float(app.get("market").get_tick_size(symbol) or 0.0)
                     except Exception:
                         tick_real = None
-                    # df для уровней
+                    # df для оценки уровней
                     df15 = app.get("market").fetch_ohlcv(symbol, "15m", 240)
                     df1h = app.get("market").fetch_ohlcv(symbol, "1h", 420)
                     need_fix = TAC_TPB_FORCE or (TAC_TPB_AUTO and _tp_anomaly(entry, sl0, tps0))
