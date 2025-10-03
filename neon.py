@@ -575,14 +575,27 @@ async def _analysis_only_flow(app: Dict[str, Any], message: Message, bot, user_i
             side_score, side, details = res
             details = dict(details or {})
         else:
-            score_symbol_quick = app.get("score_symbol_quick")
-            quick = score_symbol_quick(symbol)
-            if quick:
-                side, details = quick
-                side_score = float(details.get("score", 0.9))
-                details = dict(details or {})
-            else:
-                raise RuntimeError("Нет данных для анализа.")
+        score_symbol_quick = app.get("score_symbol_quick")
+        quick = score_symbol_quick(symbol) if callable(score_symbol_quick) else None
+        if quick:
+            side, details = quick
+            side_score = float(details.get("score", 0.9))
+            details = dict(details or {})
+        else:
+            # Fallback: показать тех.обзор вместо ошибки
+            report = None
+            try:
+                import ta as _ta_mod
+                report = _ta_mod._build_tech_report(app, symbol)
+            except Exception:
+                report = None
+            if report:
+                await message.answer(report)
+                return
+            # Мягкий текст вместо падения
+            base = symbol.split("/")[0]
+            await message.answer(f"Сейчас по {base} нет надёжного сетапа.\nНаблюдаем: retest VWAP/IB, ADX ≥ 20, согласование 1h/4h EMA200.")
+            return
     except Exception as e:
         logger and logger.exception("NEON analysis failed for %s: %s", symbol, e)
         with contextlib.suppress(Exception):
