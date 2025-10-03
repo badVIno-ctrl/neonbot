@@ -2,7 +2,7 @@
 # Ultra-TA finalizer patch: microstructure/regimes/SMC/RS/breadth/news + final SL/TP sanity
 # Works as an add-on via patch(app), no edits in other files.
 # Load last:
-#   TA_PATCH_MODULES=main,lock,chat,neon,ta,tacoin,new
+#   TA_PATCH_MODULES=main,lock,chat,neon,ta,tacoin,vera,vino,scanner,new
 
 from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple, List
@@ -17,40 +17,33 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
-# ============================ ENV FLAGS / WEIGHTS ============================
-NEW_LOOP_GUARD     = os.getenv("NEW_LOOP_GUARD", "1") == "1"     # idempotent loop guards for channel/admin loops
-NEW_CITY_FIX       = os.getenv("NEW_CITY_FIX", "1") == "1"       # ensure users.city before loops
-NEW_SCORE_ENGINE   = os.getenv("NEW_SCORE_ENGINE", "1") == "1"   # TA engine wrap (microstructure/regimes/SMC/etc)
-NEW_REASON_WRAP    = os.getenv("NEW_REASON_WRAP", "1") == "1"    # add 'Качество:' only if not present
-NEW_TRAILING_WRAP  = os.getenv("NEW_TRAILING_WRAP", "1") == "1"  # dynamic TP tune + regime-aware BE
-NEW_WATCH_SIDECAR  = os.getenv("NEW_WATCH_SIDECAR", "1") == "1"  # microstructure alerts
-NEW_TA_REPORT_WRAP = os.getenv("NEW_TA_REPORT_WRAP", "1") == "1" # extra context in TA report (/tacoin)
-NEW_FINAL_SIG_FIX  = os.getenv("NEW_FINAL_SIG_FIX", "1") == "1"  # FINAL SL/TP sanity via format_signal_message wrap
+NEW_LOOP_GUARD     = os.getenv("NEW_LOOP_GUARD", "1") == "1"
+NEW_CITY_FIX       = os.getenv("NEW_CITY_FIX", "1") == "1"
+NEW_SCORE_ENGINE   = os.getenv("NEW_SCORE_ENGINE", "1") == "1"
+NEW_REASON_WRAP    = os.getenv("NEW_REASON_WRAP", "1") == "1"
+NEW_TRAILING_WRAP  = os.getenv("NEW_TRAILING_WRAP", "1") == "1"
+NEW_WATCH_SIDECAR  = os.getenv("NEW_WATCH_SIDECAR", "1") == "1"
+NEW_TA_REPORT_WRAP = os.getenv("NEW_TA_REPORT_WRAP", "1") == "1"
+NEW_FINAL_SIG_FIX  = os.getenv("NEW_FINAL_SIG_FIX", "1") == "1"
 
-# Microstructure
 NEW_OB_SPOOF     = os.getenv("NEW_OB_SPOOF", "1") == "1"
 NEW_OFI_VPIN     = os.getenv("NEW_OFI_VPIN", "1") == "1"
-NEW_MICRO_GRAD   = os.getenv("NEW_MICRO_GRAD", "1") == "1"  # slope/microprice drift
+NEW_MICRO_GRAD   = os.getenv("NEW_MICRO_GRAD", "1") == "1"
 
-# Regimes / filters
 NEW_HMM          = os.getenv("NEW_HMM", "1") == "1"
 NEW_ALIGN_MTF    = os.getenv("NEW_ALIGN_MTF", "1") == "1"
 NEW_BREADTH      = os.getenv("NEW_BREADTH", "1") == "1"
 NEW_RS           = os.getenv("NEW_RS", "1") == "1"
-NEW_BTC_DOM      = os.getenv("NEW_BTC_DOM", "1") == "1"  # оффлайн-грубая оценка, без HTTP
+NEW_BTC_DOM      = os.getenv("NEW_BTC_DOM", "1") == "1"
 
-# Structure / SMC
 NEW_SMC_STRICT   = os.getenv("NEW_SMC_STRICT", "1") == "1"
 NEW_EQ_TOL       = float(os.getenv("NEW_EQ_TOL", "0.0008"))
 
-# News probabilistic tweak (без HTTP — только лог по уже имеющемуся note)
 NEW_NEWS_LOG     = os.getenv("NEW_NEWS_LOG", "1") == "1"
 
-# Dynamic TP/BE tuning
 NEW_TP_TUNE      = os.getenv("NEW_TP_TUNE", "1") == "1"
 NEW_BE_REGIME    = os.getenv("NEW_BE_REGIME", "1") == "1"
 
-# Weights (soft nudges)
 W_ALIGN    = float(os.getenv("NEW_W_ALIGN", "0.14"))
 W_OFI      = float(os.getenv("NEW_W_OFI", "0.11"))
 W_VPIN     = float(os.getenv("NEW_W_VPIN", "0.10"))
@@ -65,34 +58,45 @@ W_BTC_DOM  = float(os.getenv("NEW_W_BTC_DOM", "-0.08"))
 W_SMC      = float(os.getenv("NEW_W_SMC", "0.14"))
 W_NEWS     = float(os.getenv("NEW_W_NEWS", "0.08"))
 
-# Thresholds / params
 OB_CACHE_SEC     = float(os.getenv("NEW_OB_CACHE_SEC", "8.0"))
-OFI_WIN          = int(os.getenv("NEW_OFI_WIN", "60"))           # bars for OFI
+OFI_WIN          = int(os.getenv("NEW_OFI_WIN", "60"))
 VPIN_BUCKETS     = int(os.getenv("NEW_VPIN_BUCKETS", "20"))
 SPREAD_Z_MAX     = float(os.getenv("NEW_SPREAD_Z_MAX", "3.0"))
 CHURN_MAX        = float(os.getenv("NEW_CHURN_MAX", "1.8"))
 SPOOF_K          = float(os.getenv("NEW_SPOOF_K", "3.0"))
 SPOOF_DROP       = float(os.getenv("NEW_SPOOF_DROP", "0.60"))
-NEAR_PCT         = float(os.getenv("NEW_NEAR_PCT", "0.0010"))    # ±0.10% of mid
+NEAR_PCT         = float(os.getenv("NEW_NEAR_PCT", "0.0010"))
 ALIGN_PENALTY    = float(os.getenv("NEW_ALIGN_PENALTY", "0.15"))
-BARRIER_ATR      = float(os.getenv("NEW_BARRIER_ATR", "0.20"))   # TP tune if barrier within N*ATR
+BARRIER_ATR      = float(os.getenv("NEW_BARRIER_ATR", "0.20"))
 RVOL_SPIKE       = float(os.getenv("NEW_RVOL_SPIKE", "1.25"))
 
-# Final signal sanity defaults (if app's env missing)
 SAN_SL_MIN_ATR   = float(os.getenv("TA_SAN_SL_MIN_ATR", "0.25"))
 SAN_SL_MAX_ATR   = float(os.getenv("TA_SAN_SL_MAX_ATR", "5.0"))
 SAN_TP_MIN_ATR   = float(os.getenv("TA_SAN_TP_MIN_STEP_ATR", "0.15"))
 TP_CAP_ATR_MAX   = float(os.getenv("TA_TP_CAP_ATR_MAX", "4.0"))
 TP_CAP_PDR_MULT  = float(os.getenv("TA_TP_CAP_PDR_MULT", "1.2"))
-TP_MAX_PCT       = float(os.getenv("TAC_TP_MAX_PCT", "0.25"))    # cap by percentage from entry
+TP_MAX_PCT       = float(os.getenv("TAC_TP_MAX_PCT", "0.25"))
 
 BE_MIN           = float(os.getenv("NEW_BE_MIN_ATR", "1.0"))
 BE_MAX           = float(os.getenv("NEW_BE_MAX_ATR", "1.5"))
 
-SAFE_DEC_MIN     = int(os.getenv("TAC_SAFE_DECIMALS_MIN", "6"))
-SAFE_DEC_MAX     = int(os.getenv("TAC_SAFE_DECIMALS_MAX", "8"))
+SCALP_MODE      = os.getenv("NEW_SCALP_MODE", "1") == "1"
+SCALP_FORCE     = os.getenv("NEW_SCALP_FORCE", "1") == "1"
+def _env_list_float(name: str, default: str) -> List[float]:
+    txt = os.getenv(name, default)
+    out = []
+    for p in (txt or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.append(float(p))
+        except Exception:
+            pass
+    return out
+SCALP_TP_PCTS   = _env_list_float("NEW_SCALP_TP_PCTS", "0.022,0.08,0.125")
+SCALP_SL_PCT    = float(os.getenv("NEW_SCALP_SL_PCT", "0.055"))
 
-# ============================ UTILS ============================
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -112,7 +116,6 @@ def _tanh_clip(x: float, s: float = 1.0) -> float:
     except Exception:
         return 0.0
 
-# ============================ LOOP GUARDS / CITY FIX ============================
 def _wrap_loop_once(logger, key_name: str, orig_fn):
     async def wrapper(app: Dict[str, Any], bot, *args, **kwargs):
         once = app.setdefault("_new_once", {"loops": set()})
@@ -132,7 +135,6 @@ async def _ensure_city_column(app: Dict[str, Any]):
         await db.conn.execute("ALTER TABLE users ADD COLUMN city TEXT")
         await db.conn.commit()
 
-# ============================ MICROSTRUCTURE ============================
 _ORDERBOOK_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 def _ob_cache_key(ex_id: str, resolved: str) -> str:
@@ -175,12 +177,10 @@ def _book_features(ob: Dict[str, Any]) -> Dict[str, float]:
         spread = max(0.0, pa - pb)
         denom = max(1e-9, (mid * 0.001))
         out["spread_norm"] = float(spread / denom)
-
         sb = float(sum([float(q) for _, q in bids[:25]]))
         sa = float(sum([float(q) for _, q in asks[:25]]))
         if sb + sa > 0:
             out["book_imb"] = float((sb - sa) / (sb + sa))
-
         def near_ratio(levels):
             keep = 0.0
             tot = 0.0
@@ -190,9 +190,9 @@ def _book_features(ob: Dict[str, Any]) -> Dict[str, float]:
                 if abs(p - mid) / (mid + 1e-9) <= NEAR_PCT:
                     keep += q
             return float(keep / (tot + 1e-9))
-        out["near_depth_ratio"] = float(0.5 * (near_ratio(bids) + near_ratio(asks)))
-
-        # churn/spoof
+        near_bid = near_ratio(bids)
+        near_ask = near_ratio(asks)
+        out["near_depth_ratio"] = float(0.5 * (near_bid + near_ask))
         key = f"default:{mid:.8f}"
         prev = _ORDERBOOK_CACHE.get(key)
         snap = {"bids": [(float(p), float(q)) for p, q in bids[:10]],
@@ -211,7 +211,6 @@ def _book_features(ob: Dict[str, Any]) -> Dict[str, float]:
             churn_b = churn_side(snap["bids"], prv.get("bids", []))
             churn_a = churn_side(snap["asks"], prv.get("asks", []))
             out["churn"] = float(0.5 * (churn_b + churn_a))
-
             def max_wall(levels):
                 if not levels: return 0.0
                 sizes = np.array([float(q) for _, q in levels], dtype=float)
@@ -223,8 +222,6 @@ def _book_features(ob: Dict[str, Any]) -> Dict[str, float]:
             spoof_b = 1.0 if (prv_bk >= SPOOF_K and (cur_bk / max(1e-9, prv_bk)) <= (1.0 - SPOOF_DROP)) else 0.0
             spoof_a = 1.0 if (prv_ak >= SPOOF_K and (cur_ak / max(1e-9, prv_ak)) <= (1.0 - SPOOF_DROP)) else 0.0
             out["spoof_score"] = float(spoof_b + spoof_a)
-
-        # liquidity slope + microprice drift
         def liquidity_slope(levels, sign: int) -> float:
             if not levels:
                 return 0.0
@@ -236,7 +233,6 @@ def _book_features(ob: Dict[str, Any]) -> Dict[str, float]:
             return float(sign * a)
         slope = liquidity_slope(asks, +1) + liquidity_slope(bids, -1)
         out["slope"] = float(slope)
-
         mp = (pa * qb + pb * qa) / (qa + qb + 1e-9)
         out["microprice_drift"] = float((mp - mid) / (mid + 1e-9))
     except Exception:
@@ -259,7 +255,6 @@ def _ofi_vpin(df: Optional[pd.DataFrame]) -> Tuple[Optional[float], Optional[flo
     except Exception:
         return None, None
 
-# ============================ REGIMES / INDICATORS ============================
 def _adx(df: Optional[pd.DataFrame], period: int = 14) -> Optional[float]:
     try:
         if df is None: return None
@@ -321,7 +316,6 @@ def _alignment_penalty(details: Dict[str, Any], side: str) -> float:
         return +0.05
     return +0.08
 
-# ============================ SMC STRICT ============================
 def _improved_fvg_ob(df: Optional[pd.DataFrame], atr_val: float) -> Tuple[bool, bool]:
     try:
         if df is None or len(df) < 60 or atr_val <= 0:
@@ -375,7 +369,6 @@ def _bos_choch_strict(df: Optional[pd.DataFrame], lookback: int = 80, k: float =
     except Exception:
         return 0, False
 
-# ============================ RS / BREADTH / DOMINANCE ============================
 _BREADTH_CACHE_NEW: Dict[str, Any] = {"ts": 0.0, "data": None}
 
 def _compute_breadth(app: Dict[str, Any], ttl_sec: int = 300) -> Dict[str, Any]:
@@ -415,10 +408,6 @@ def _compute_breadth(app: Dict[str, Any], ttl_sec: int = 300) -> Dict[str, Any]:
         return {"total": 0}
 
 def _estimate_btc_dom_trend(app: Dict[str, Any], win: int = 72) -> Optional[str]:
-    """
-    Оценка «тренда доминации» BTC без HTTP:
-    сравниваем склон (slope) лог-отношения BTC к «альт индексу» за окно win*5m (~6h).
-    """
     try:
         market = app.get("market")
         symbols = [s for s in app.get("SYMBOLS", []) if isinstance(s, str)]
@@ -426,10 +415,9 @@ def _estimate_btc_dom_trend(app: Dict[str, Any], win: int = 72) -> Optional[str]
         btc = market.fetch_ohlcv("BTC/USDT", "5m", max(win + 10, 200))
         if btc is None or len(btc) < win + 10 or not alts:
             return None
-        # построим «альт-индекс» как средний лог-цен
         alt_closes: List[np.ndarray] = []
         count = 0
-        for sym in alts[:20]:  # ограничим до 20, чтобы не грузить
+        for sym in alts[:20]:
             df = market.fetch_ohlcv(sym, "5m", max(win + 10, 200))
             if df is not None and len(df) >= win + 10:
                 alt_closes.append(df["close"].astype(float).tail(win).values)
@@ -452,7 +440,6 @@ def _estimate_btc_dom_trend(app: Dict[str, Any], win: int = 72) -> Optional[str]
     except Exception:
         return None
 
-# ============================ NEWS PROBABILITY ============================
 def _news_logistic_p(note: str) -> Optional[float]:
     try:
         t = (note or "").lower()
@@ -469,7 +456,6 @@ def _news_logistic_p(note: str) -> Optional[float]:
     except Exception:
         return None
 
-# ============================ TP/SL UTILITIES ============================
 def _infer_safe_tick(entry: float, df15: Optional[pd.DataFrame]) -> float:
     try:
         if entry <= 0:
@@ -492,11 +478,11 @@ def _infer_safe_tick(entry: float, df15: Optional[pd.DataFrame]) -> float:
 
 def _round_tick(x: float, tick: float, mode: str) -> float:
     try:
-        n = float(x) / float(tick if tick>0 else 1e-9)
+        n = float(x) / (tick if tick>0 else 1e-9)
         if mode == "floor": n = math.floor(n)
         elif mode == "ceil": n = math.ceil(n)
         else: n = round(n)
-        return float(n * float(tick if tick>0 else 1e-9))
+        return float(n * (tick if tick>0 else 1e-9))
     except Exception:
         return float(x)
 
@@ -506,8 +492,7 @@ def _compute_pdh_pdl(df15: Optional[pd.DataFrame]) -> Optional[Tuple[float, floa
         ts = df15["ts"]
         last_ts = pd.to_datetime(ts.iloc[-1], utc=True, errors="coerce").to_pydatetime()
         day_anchor = last_ts.replace(hour=0, minute=0, second=0, microsecond=0)
-        prev_day_start = day_anchor - timedelta(days=1)
-        prev = df15[(ts >= prev_day_start) & (ts < day_anchor)]
+        prev = df15[(ts >= day_anchor - timedelta(days=1)) & (ts < day_anchor)]
         if prev is None or prev.empty: return None
         pdh = float(prev["high"].max()); pdl = float(prev["low"].min())
         if not (math.isfinite(pdh) and math.isfinite(pdl) and pdh > pdl): return None
@@ -536,11 +521,11 @@ def _cap_tp(entry: float, tp: float, atr: float, side: str, tp_max_pct: float, t
     if side == "LONG":
         cap1 = entry * (1.0 + tp_max_pct)
         cap2 = entry + tp_cap_atr_max * atr
-        return float(min(tp, cap1, cap2))
+        return min(tp, cap1, cap2)
     else:
         cap1 = entry * (1.0 - tp_max_pct)
         cap2 = entry - tp_cap_atr_max * atr
-        return float(max(tp, cap1, cap2))
+        return max(tp, cap1, cap2)
 
 def _cap_tp_by_pdr(entry: float, tp: float, side: str, pdh_pdl: Optional[Tuple[float,float]]) -> float:
     try:
@@ -553,6 +538,35 @@ def _cap_tp_by_pdr(entry: float, tp: float, side: str, pdh_pdl: Optional[Tuple[f
     except Exception:
         return tp
 
+def _apply_scalp_levels(entry: float, side: str, tick: float) -> Tuple[float, List[float]]:
+    entry = float(entry)
+    pcts = SCALP_TP_PCTS[:] if SCALP_TP_PCTS else [0.022, 0.08, 0.125]
+    sl_pct = SCALP_SL_PCT if SCALP_SL_PCT > 0 else 0.05
+    if side == "LONG":
+        tps = [entry * (1.0 + p) for p in pcts[:3]]
+        sl = entry * (1.0 - sl_pct)
+        tps = [_round_tick(tp, tick, "ceil") for tp in tps]
+        sl  = _round_tick(sl, tick, "floor")
+    else:
+        tps = [entry * (1.0 - p) for p in pcts[:3]]
+        sl = entry * (1.0 + sl_pct)
+        tps = [_round_tick(tp, tick, "floor") for tp in tps]
+        sl  = _round_tick(sl, tick, "ceil")
+    step_tick = max(tick, 1e-12) * 2.0
+    if side == "LONG":
+        tps = sorted(tps)
+        for i in range(1, len(tps)):
+            if tps[i] <= tps[i-1]:
+                tps[i] = tps[i-1] + step_tick
+                tps[i] = _round_tick(tps[i], tick, "ceil")
+    else:
+        tps = sorted(tps, reverse=True)
+        for i in range(1, len(tps)):
+            if tps[i] >= tps[i-1]:
+                tps[i] = tps[i-1] - step_tick
+                tps[i] = _round_tick(tps[i], tick, "floor")
+    return float(sl), [float(x) for x in tps[:3]]
+
 def _final_signal_sanity(app: Dict[str, Any], sig) -> Tuple[bool, List[str]]:
     notes: List[str] = []
     changed = False
@@ -560,29 +574,64 @@ def _final_signal_sanity(app: Dict[str, Any], sig) -> Tuple[bool, List[str]]:
         market = app.get("market")
         atr_fn = app.get("atr")
         df15 = market.fetch_ohlcv(sig.symbol, "15m", 240)
-        entry = float(sig.entry); sl = float(sig.sl)
+        df1h = None
+        df5 = None
+        entry = float(sig.entry)
+        sl = float(sig.sl)
         tps = [float(x) for x in list(sig.tps or [])]
-        if df15 is None or len(df15) < 30 or entry <= 0:
-            return False, notes
-        atrv = float(atr_fn(df15, 14).iloc[-1]) if callable(atr_fn) else float(((df15["high"]-df15["low"]).rolling(14).mean()).iloc[-1])
-        if not (atrv > 0):
-            return False, notes
-        tick_real = 0.0
+        try:
+            if df15 is not None and len(df15) >= 20:
+                atrv = float(atr_fn(df15, 14).iloc[-1]) if callable(atr_fn) else float(((df15["high"]-df15["low"]).rolling(14).mean()).iloc[-1])
+            else:
+                df1h = market.fetch_ohlcv(sig.symbol, "1h", 360)
+                df5  = market.fetch_ohlcv(sig.symbol, "5m", 360)
+                if df1h is not None and len(df1h) >= 50:
+                    atrv = float(((df1h["high"]-df1h["low"]).rolling(14).mean()).iloc[-1]) / 4.0
+                elif df5 is not None and len(df5) >= 100:
+                    atrv = float(((df5["high"]-df5["low"]).rolling(14).mean()).iloc[-1]) * 3.0
+                else:
+                    atrv = max(1e-9, 0.001*entry)
+        except Exception:
+            atrv = max(1e-9, 0.001*entry)
         try:
             tick_real = float(market.get_tick_size(sig.symbol) or 0.0)
         except Exception:
             tick_real = 0.0
-        safe_tick = _infer_safe_tick(entry, df15)
-        tick = float(min(safe_tick if safe_tick>0 else 1e-9, tick_real if tick_real>0 else safe_tick))
+        def _infer_tick() -> float:
+            try:
+                if entry <= 0: return 1e-6
+                if entry >= 100: decimals = 2
+                elif entry >= 10: decimals = 3
+                elif entry >= 1: decimals = 4
+                elif entry >= 0.1: decimals = 5
+                else: decimals = 6
+                tick = 10 ** (-decimals)
+                if df15 is not None and len(df15) >= 20:
+                    med_rng = float((df15["high"] - df15["low"]).tail(20).median())
+                    est_spread = med_rng * 0.1
+                    if est_spread > 0:
+                        tick = min(tick, est_spread / 10.0)
+                return max(tick, 10 ** (-8))
+            except Exception:
+                return 10 ** (-6)
+        tick = min(_infer_tick(), tick_real or 1e9)
         a_min = float(app.get("TA_SAN_SL_MIN_ATR", SAN_SL_MIN_ATR))
         a_max = float(app.get("TA_SAN_SL_MAX_ATR", SAN_SL_MAX_ATR))
         step_atr = float(app.get("TA_SAN_TP_MIN_STEP_ATR", SAN_TP_MIN_ATR))
         cap_atr = float(app.get("TA_TP_CAP_ATR_MAX", TP_CAP_ATR_MAX))
         pct_cap = float(os.getenv("TAC_TP_MAX_PCT", str(TP_MAX_PCT)))
+        def _rt(x, mode):
+            n = float(x) / (tick if tick>0 else 1e-9)
+            if mode == "floor": n = math.floor(n)
+            elif mode == "ceil": n = math.ceil(n)
+            else: n = round(n)
+            return float(n * (tick if tick>0 else 1e-9))
         if sig.side == "LONG":
-            if not (sl < entry): sl = entry - a_min*atrv; changed = True; notes.append("SL side")
+            if not (sl < entry):
+                sl = entry - a_min*atrv; changed = True; notes.append("SL side")
         else:
-            if not (sl > entry): sl = entry + a_min*atrv; changed = True; notes.append("SL side")
+            if not (sl > entry):
+                sl = entry + a_min*atrv; changed = True; notes.append("SL side")
         risk = abs(entry - sl)
         if risk < a_min*atrv:
             sl = entry - a_min*atrv if sig.side=="LONG" else entry + a_min*atrv
@@ -590,88 +639,94 @@ def _final_signal_sanity(app: Dict[str, Any], sig) -> Tuple[bool, List[str]]:
         elif risk > a_max*atrv:
             sl = entry - a_max*atrv if sig.side=="LONG" else entry + a_max*atrv
             changed = True; notes.append("SL>maxATR")
-        sl = _round_tick(sl, tick, "floor" if sig.side=="LONG" else "ceil")
-        if sl <= 0:
-            sl = _round_tick(entry - a_min*atrv if sig.side=="LONG" else entry + a_min*atrv, tick, "floor" if sig.side=="LONG" else "ceil")
-            changed = True; notes.append("SL zero-guard")
-
-        if not tps:
-            muls = [0.8, 1.5, 2.4]
-            tps = [entry + m*atrv if sig.side=="LONG" else entry - m*atrv for m in muls]
-
-        pd = _compute_pdh_pdl(df15)
-        tps0 = list(tps)
-        capped = []
-        for tp in tps:
-            tp1 = _cap_tp(entry, tp, atrv, sig.side, pct_cap, cap_atr)
-            tp2 = _cap_tp_by_pdr(entry, tp1, sig.side, pd)
-            capped.append(tp2)
-        if capped != tps0:
-            tps = capped; changed = True; notes.append("TP cap ATR/PDR")
-
-        tps = _ensure_tp_monotonic_with_step(sig.side, entry, tps, atrv, tick, step_atr)
-
-        if len({round(x, 12) for x in tps}) < 3:
+        sl = _rt(sl, "floor" if sig.side=="LONG" else "ceil")
+        def _tps_bad(tp_list: List[float]) -> bool:
+            if not tp_list or len(tp_list) < 3: return True
+            if any((not isinstance(x,(int,float)) or x <= 0.0) for x in tp_list): return True
+            if len({round(x, 10) for x in tp_list}) < 3: return True
+            if max(abs(x - entry) for x in tp_list) / (atrv + 1e-9) > 8.0: return True
+            return False
+        if _tps_bad(tps):
+            base = [0.8, 1.5, 2.4]
+            tps = [entry + m*atrv if sig.side=="LONG" else entry - m*atrv for m in base]
+            changed = True; notes.append("seed ATR")
+        def _cap_tp(tp: float) -> float:
             if sig.side == "LONG":
-                tps[1] = max(tps[1], tps[0] + step_atr*atrv)
-                tps[2] = max(tps[2], tps[1] + step_atr*atrv)
+                return min(tp, entry + cap_atr*atrv, entry*(1.0+pct_cap))
             else:
-                tps[1] = min(tps[1], tps[0] - step_atr*atrv)
-                tps[2] = min(tps[2], tps[1] - step_atr*atrv)
-            tps = _ensure_tp_monotonic_with_step(sig.side, entry, tps, atrv, tick, step_atr)
-            changed = True; notes.append("TP de-dup")
-
-        tps = [ _round_tick(x, tick, "ceil" if sig.side=="LONG" else "floor") for x in tps ]
-
+                return max(tp, entry - cap_atr*atrv, entry*(1.0-pct_cap))
+        pd = None
+        try:
+            if df15 is not None and len(df15) >= 60:
+                ts = df15["ts"]; last = ts.iloc[-1].to_pydatetime().astimezone(timezone.utc)
+                day_anchor = last.replace(hour=0, minute=0, second=0, microsecond=0)
+                prev = df15[(ts >= day_anchor - timedelta(days=1)) & (ts < day_anchor)]
+                if prev is not None and not prev.empty:
+                    pdh = float(prev["high"].max()); pdl = float(prev["low"].min())
+                    if pdh > pdl: pd = (pdh, pdl)
+        except Exception:
+            pd = None
+        def _cap_by_pdr(tp: float) -> float:
+            if not pd: return tp
+            pdh, pdl = pd
+            dr = abs(pdh - pdl)
+            cap = entry + (float(app.get("TA_TP_CAP_PDR_MULT", 1.2)) * dr) * (1 if sig.side=="LONG" else -1)
+            return min(tp, cap) if sig.side=="LONG" else max(tp, cap)
+        tps = [_cap_by_pdr(_cap_tp(tp)) for tp in tps]
+        tps = _ensure_tp_monotonic_with_step(sig.side, entry, tps, atrv, tick, step_atr)
+        if sig.side == "LONG":
+            tps = [_rt(x, "ceil") for x in tps]
+        else:
+            tps = [_rt(x, "floor") for x in tps]
+        if len({round(x, 10) for x in tps}) < 3:
+            step_tick = max(tick, 1e-12) * 2.0
+            if sig.side == "LONG":
+                tps = sorted(tps)
+                for i in range(1, len(tps)):
+                    if tps[i] <= tps[i-1]:
+                        tps[i] = _rt(tps[i-1] + step_tick, "ceil")
+            else:
+                tps = sorted(tps, reverse=True)
+                for i in range(1, len(tps)):
+                    if tps[i] >= tps[i-1]:
+                        tps[i] = _rt(tps[i-1] - step_tick, "floor")
         if float(sig.sl) != float(sl) or [float(x) for x in sig.tps] != [float(x) for x in tps]:
             sig.sl = float(sl)
             sig.tps = [float(x) for x in tps]
             changed = True
-
     except Exception:
         pass
     return changed, notes
 
-# ============================ GRADE LINE ============================
-def _grade(exec_spread, near_ratio, spoof, churn, adx, hmm, vpin) -> Tuple[str, str, str, str, str]:
-    def g_exec():
-        if exec_spread is None or near_ratio is None: return "C"
-        if exec_spread <= SPREAD_Z_MAX and near_ratio >= 0.55: return "A"
-        if exec_spread <= SPREAD_Z_MAX*1.3 and near_ratio >= 0.40: return "B"
-        return "C"
-    def g_break():
-        if spoof and spoof >= 1.0: return "C"
-        if churn and churn > CHURN_MAX: return "C"
-        return "B"
-    def g_reg():
-        if adx and adx >= 30: return "A"
-        if adx and adx >= 20: return "B"
-        return "C"
-    def g_liq():
-        if vpin is None: return "C"
-        if vpin <= 0.35: return "A"
-        if vpin <= 0.5: return "B"
-        return "C"
-    def g_hmm():
-        return {"trend":"A","range":"B","calm":"A","shock":"C"}.get(hmm or "range","B")
-    return g_exec(), g_break(), g_reg(), g_liq(), g_hmm()
+def _apply_scalp_levels(entry: float, side: str, tick: float) -> Tuple[float, List[float]]:
+    entry = float(entry)
+    pcts = SCALP_TP_PCTS[:] if SCALP_TP_PCTS else [0.022, 0.08, 0.125]
+    sl_pct = SCALP_SL_PCT if SCALP_SL_PCT > 0 else 0.05
+    if side == "LONG":
+        tps = [entry * (1.0 + p) for p in pcts[:3]]
+        sl = entry * (1.0 - sl_pct)
+        tps = [_round_tick(tp, tick, "ceil") for tp in tps]
+        sl  = _round_tick(sl, tick, "floor")
+    else:
+        tps = [entry * (1.0 - p) for p in pcts[:3]]
+        sl = entry * (1.0 + sl_pct)
+        tps = [_round_tick(tp, tick, "floor") for tp in tps]
+        sl  = _round_tick(sl, tick, "ceil")
+    step_tick = max(tick, 1e-12) * 2.0
+    if side == "LONG":
+        tps = sorted(tps)
+        for i in range(1, len(tps)):
+            if tps[i] <= tps[i-1]:
+                tps[i] = tps[i-1] + step_tick
+                tps[i] = _round_tick(tps[i], tick, "ceil")
+    else:
+        tps = sorted(tps, reverse=True)
+        for i in range(1, len(tps)):
+            if tps[i] >= tps[i-1]:
+                tps[i] = tps[i-1] - step_tick
+                tps[i] = _round_tick(tps[i], tick, "floor")
+    return float(sl), [float(x) for x in tps[:3]]
 
-def _append_quality_if_absent(text: str, d: Dict[str, Any]) -> str:
-    if "Качество:" in (text or ""):
-        return text
-    exec_spread = d.get("spread_norm")
-    near_ratio  = d.get("near_depth_ratio")
-    spoof       = d.get("spoof_score")
-    churn       = d.get("churn")
-    adx         = d.get("adx15") or d.get("ta_adx15_alt")
-    hmm         = d.get("regime_hmm")
-    vpin        = d.get("vpin")
-    q1,q2,q3,q4,q5 = _grade(exec_spread, near_ratio, spoof, churn, adx, hmm, vpin)
-    lm = d.get("ta_liq_summary") or d.get("liq_summary") or ""
-    line = f"Качество: Exec {q1} • Break {q2} • Reg {q3} • Liq {q4} • HMM {q5}" + (f" • LM: {lm}" if lm else "")
-    return (text + (" • " if text else "") + line)[:1100]
-
-# ============================ HMM-BE & TP TUNE ============================
 def _tp_dynamic_adjust(app: Dict[str, Any], symbol: str, side: str, tps: List[float], entry: float, atr_val: float) -> List[float]:
     try:
         market = app.get("market")
@@ -725,7 +780,6 @@ def _be_regime_adjust(side: str, entry: float, sl: float, atr_val: float, hmm: s
     except Exception:
         return sl
 
-# ============================ WATCH: SIDECAR ALERTS ============================
 async def _watch_sidecar(app: Dict[str, Any], bot, chat_id: int, sig):
     logger = app.get("logger")
     _should_alert = app.get("_should_alert")
@@ -749,7 +803,6 @@ async def _watch_sidecar(app: Dict[str, Any], bot, chat_id: int, sig):
                     await bot.send_message(chat_id, f"⚠️ Нестабильная книга {sig.symbol.split('/')[0]} — повышен риск фейков.")
             except Exception:
                 pass
-
             try:
                 if df15 is not None and len(df15) >= 60 and atrv>0:
                     x = df15.tail(240).copy()
@@ -783,7 +836,6 @@ async def _watch_sidecar(app: Dict[str, Any], bot, chat_id: int, sig):
     except Exception as e:
         logger and logger.debug("new sidecar error: %s", e)
 
-# ============================ KeepAlive + throttle (free-host friendly) ============================
 try:
     import aiohttp
     from aiohttp import web as _web
@@ -803,16 +855,12 @@ async def _start_keepalive_http(app: Dict[str, Any]):
         app.get("logger") and app["logger"].warning("KeepAlive HTTP: aiohttp не доступен, пропускаю.")
         return
     port = int(os.getenv("KEEPALIVE_PORT") or os.getenv("PORT") or "8080")
-
     wa = _web.Application()
-
     async def _h_health(request):
         return _web.Response(text="OK", content_type="text/plain")
     async def _h_time(request):
         return _web.json_response({"ts": int(time.time())})
-
     wa.add_routes([_web.get("/health", _h_health), _web.get("/time", _h_time)])
-
     runner = _web.AppRunner(wa)
     await runner.setup()
     site = _web.TCPSite(runner, "0.0.0.0", port)
@@ -830,7 +878,6 @@ async def _keepalive_ping_loop(app: Dict[str, Any]):
         if not guess.startswith("http"):
             guess = "https://" + guess
         urls = [guess.rstrip("/") + "/health"]
-
     interval = int(os.getenv("KEEPALIVE_INTERVAL_SEC", "240"))
     if not urls:
         app.get("logger") and app["logger"].info("KeepAlive ping: URL не задан(ы). Рекомендую KEEPALIVE_URL=https://<ваш-хост>/health")
@@ -868,7 +915,6 @@ def _patch_mark_price_cache(app: Dict[str, Any]):
         return
     ttl = float(os.getenv("NEW_MARK_PRICE_CACHE_SEC", "8.0"))
     orig = market.fetch_mark_price
-
     def _cached(symbol: str) -> Optional[float]:
         now = time.time()
         ts, val = _MARK_CACHE.get(symbol, (0.0, None))
@@ -881,7 +927,6 @@ def _patch_mark_price_cache(app: Dict[str, Any]):
             return v
         except Exception:
             return val
-
     market.fetch_mark_price = _cached
     app.get("logger") and app["logger"].info(f"MarkPrice cache: включён (TTL {ttl:.1f}s)")
 
@@ -897,13 +942,12 @@ def _bump_ohlcv_ttl(app: Dict[str, Any]):
     except Exception:
         pass
 
-# ============================ DM TICKER (private chat "plaque") ============================
 DM_TICKER_ENABLED       = os.getenv("DM_TICKER_ENABLED", "1") == "1"
 DM_TICKER_COINS         = [s.strip().upper() for s in (os.getenv("DM_TICKER_COINS", "BTC,ETH,SOL,BNB,TON")).split(",") if s.strip()]
 DM_TICKER_ROTATE_SEC    = int(os.getenv("DM_TICKER_ROTATE_SEC", "3"))
-DM_TICKER_LIFETIME_SEC  = int(os.getenv("DM_TICKER_LIFETIME_SEC", "900"))   # 0 = бесконечно
+DM_TICKER_LIFETIME_SEC  = int(os.getenv("DM_TICKER_LIFETIME_SEC", "900"))
 DM_TICKER_PIN           = os.getenv("DM_TICKER_PIN", "1") == "1"
-DM_TICKER_PCT_TTL_SEC   = int(os.getenv("DM_TICKER_PCT_TTL_SEC", "60"))     # кэш процента на минуту
+DM_TICKER_PCT_TTL_SEC   = int(os.getenv("DM_TICKER_PCT_TTL_SEC", "60"))
 
 def _fmt_price_usd(v: Optional[float]) -> str:
     if v is None:
@@ -929,7 +973,6 @@ def _get_price_and_pct(app: Dict[str, Any], symbol: str) -> Tuple[Optional[float
     price = None; pct = None
     with contextlib.suppress(Exception):
         price = market.fetch_mark_price(symbol)
-    # percentage с кэшем
     now = time.time()
     ts, prev = _PCT_CACHE.get(symbol, (0.0, None))
     if prev is not None and (now - ts) < DM_TICKER_PCT_TTL_SEC:
@@ -946,10 +989,8 @@ async def _dm_ticker_loop(app: Dict[str, Any], bot, user_id: int):
     coins = DM_TICKER_COINS[:]
     if not coins:
         coins = ["BTC","ETH","SOL","BNB","TON"]
-    # найти/создать сообщение
     dm_state = app.setdefault("_dm_tickers", {})
     ent = dm_state.setdefault(user_id, {"mid": None, "expires": 0.0, "task": None})
-    # если сообщения нет — создаём
     if not ent["mid"]:
         try:
             m = await bot.send_message(user_id, "💹 Живые цены — инициализация...")
@@ -959,9 +1000,7 @@ async def _dm_ticker_loop(app: Dict[str, Any], bot, user_id: int):
                     await bot.pin_chat_message(user_id, m.message_id, disable_notification=True)
         except Exception:
             return
-    # основной цикл
     while True:
-        # остановка по lifetime (если задан)
         if DM_TICKER_LIFETIME_SEC > 0 and time.time() > float(ent.get("expires", 0.0)):
             break
         for base in coins:
@@ -971,7 +1010,6 @@ async def _dm_ticker_loop(app: Dict[str, Any], bot, user_id: int):
             try:
                 await bot.edit_message_text(chat_id=user_id, message_id=ent["mid"], text=txt)
             except Exception:
-                # возможно, юзер удалил/очистил — пробуем заново создать
                 with contextlib.suppress(Exception):
                     m2 = await bot.send_message(user_id, txt)
                     ent["mid"] = m2.message_id
@@ -979,30 +1017,24 @@ async def _dm_ticker_loop(app: Dict[str, Any], bot, user_id: int):
                         with contextlib.suppress(Exception):
                             await bot.pin_chat_message(user_id, m2.message_id, disable_notification=True)
             await asyncio.sleep(max(2, DM_TICKER_ROTATE_SEC))
-    # по окончании — опционально можно раззакрепить
 
 async def _ensure_dm_ticker(app: Dict[str, Any], bot, user_id: int):
     if not DM_TICKER_ENABLED:
         return
     dm_state = app.setdefault("_dm_tickers", {})
     ent = dm_state.setdefault(user_id, {"mid": None, "expires": 0.0, "task": None})
-    # продлеваем lifetime
     ent["expires"] = time.time() + (DM_TICKER_LIFETIME_SEC if DM_TICKER_LIFETIME_SEC > 0 else 24*3600*365)
-    # если таск не запущен — стартуем
     t = ent.get("task")
     if not t or t.done():
         task = asyncio.create_task(_dm_ticker_loop(app, bot, user_id))
         ent["task"] = task
 
-# ============================ DAILY SEND GUARDS (one per day) ============================
 def _install_daily_send_guards_new(app: Dict[str, Any]) -> None:
     import asyncio as _aio
     logger = app.get("logger")
     once = app.setdefault("_daily_once", {"lock": _aio.Lock(), "sent": set()})
-
     def _day(app_):
         return app_["now_msk"]().date().isoformat()
-
     def _wrap_send_once(tag_fn, orig_fn):
         async def wrapper(*args, **kwargs):
             key = tag_fn(*args, **kwargs)
@@ -1014,7 +1046,6 @@ def _install_daily_send_guards_new(app: Dict[str, Any]) -> None:
             return await orig_fn(*args, **kwargs)
         setattr(wrapper, "_new_wrapped", True)
         return wrapper
-
     m = sys.modules.get("main")
     if m and hasattr(m, "_post_morning_report") and callable(m._post_morning_report) and not getattr(m._post_morning_report, "_new_wrapped", False):
         orig = m._post_morning_report
@@ -1022,14 +1053,12 @@ def _install_daily_send_guards_new(app: Dict[str, Any]) -> None:
             return ("channel", str(channel_id), _day(app_))
         m._post_morning_report = _wrap_send_once(_tag_channel, orig)
         logger and logger.info("new: daily guard -> main._post_morning_report")
-
     if m and hasattr(m, "_post_admin_greetings") and callable(m._post_admin_greetings) and not getattr(m._post_admin_greetings, "_new_wrapped", False):
         orig = m._post_admin_greetings
         def _tag_admin_main(app_, bot):
             return ("admin_daily", "all", _day(app_))
         m._post_admin_greetings = _wrap_send_once(_tag_admin_main, orig)
         logger and logger.info("new: daily guard -> main._post_admin_greetings")
-
     c = sys.modules.get("chat")
     if c and hasattr(c, "_post_admin_greetings_once") and callable(c._post_admin_greetings_once) and not getattr(c._post_admin_greetings_once, "_new_wrapped", False):
         orig = c._post_admin_greetings_once
@@ -1038,11 +1067,8 @@ def _install_daily_send_guards_new(app: Dict[str, Any]) -> None:
         c._post_admin_greetings_once = _wrap_send_once(_tag_admin_chat, orig)
         logger and logger.info("new: daily guard -> chat._post_admin_greetings_once")
 
-# ============================ PATCH ENTRY ============================
 def patch(app: Dict[str, Any]) -> None:
     logger = app.get("logger")
-
-    # ---- Loop guards + city fix ----
     if NEW_LOOP_GUARD:
         m = sys.modules.get("main")
         c = sys.modules.get("chat")
@@ -1067,17 +1093,12 @@ def patch(app: Dict[str, Any]) -> None:
                 logger and logger.info("new: loop guard applied for chat._start_daily_admin_greetings_loop")
         except Exception:
             pass
-
-    # сразу установим guards отправки (один раз в день)
     _install_daily_send_guards_new(app)
-
     orig_on_startup = app.get("on_startup")
     async def _on_startup_new(bot):
-        # ensure city column
         if NEW_CITY_FIX:
             with contextlib.suppress(Exception):
                 await _ensure_city_column(app)
-        # start keepalive http + self-ping + throttles
         with contextlib.suppress(Exception):
             await _start_keepalive_http(app)
         with contextlib.suppress(Exception):
@@ -1086,15 +1107,12 @@ def patch(app: Dict[str, Any]) -> None:
             _patch_mark_price_cache(app)
         with contextlib.suppress(Exception):
             _bump_ohlcv_ttl(app)
-        # ещё раз — на случай позднего импорта модулей
         with contextlib.suppress(Exception):
             _install_daily_send_guards_new(app)
         if orig_on_startup:
             await orig_on_startup(bot)
     app["on_startup"] = _on_startup_new
     logger and logger.info("new: on_startup patched (city fix + keepalive + throttle + loop guards + daily guards).")
-
-    # ---- Score engine wrap ----
     orig_score = app.get("score_symbol_core")
     if NEW_SCORE_ENGINE and callable(orig_score):
         def _score_new(symbol: str, relax: bool = False):
@@ -1113,11 +1131,9 @@ def patch(app: Dict[str, Any]) -> None:
             except Exception: df1h = None
             try: atr15 = float(atr_fn(df15, 14).iloc[-1]) if (df15 is not None and callable(atr_fn)) else float(((df15["high"]-df15["low"]).rolling(14).mean()).iloc[-1]) if df15 is not None else 0.0
             except Exception: atr15 = 0.0
-
             ob = _fetch_order_book(app, symbol, 25)
             feats = _book_features(ob) if ob else {}
             d.update(feats)
-
             ofi, vpin = _ofi_vpin(df5)
             if ofi is not None:
                 d["ofi"] = float(ofi)
@@ -1128,7 +1144,6 @@ def patch(app: Dict[str, Any]) -> None:
                 d["vpin"] = float(vpin)
                 adj = W_VPIN * (0.5 - vpin)
                 score += adj; breakdown["VPIN"] = breakdown.get("VPIN", 0.0) + adj
-
             if feats.get("spread_norm") and feats["spread_norm"] > SPREAD_Z_MAX:
                 score += W_SPREAD; breakdown["Spread"] = breakdown.get("Spread", 0.0) + W_SPREAD
             if feats.get("churn") and feats["churn"] > CHURN_MAX:
@@ -1140,7 +1155,6 @@ def patch(app: Dict[str, Any]) -> None:
                 grad = sign * (0.3*_tanh_clip(feats["slope"], 100.0) + 0.7*_tanh_clip(feats["microprice_drift"], 0.002))
                 adj = W_GRAD * grad
                 score += adj; breakdown["BookGrad"] = breakdown.get("BookGrad", 0.0) + adj
-
             if NEW_HMM:
                 reg = _hmm_regime(df15)
                 d["regime_hmm"] = reg
@@ -1155,18 +1169,15 @@ def patch(app: Dict[str, Any]) -> None:
                 bb = _bbwp(df15["close"]) if df15 is not None else None
                 if bb is not None: d["bbwp"] = bb
             except Exception: pass
-
             if NEW_ALIGN_MTF:
                 adj = _alignment_penalty(d, side)
                 score += adj; breakdown["AlignMTF"] = breakdown.get("AlignMTF", 0.0) + adj
-
             if NEW_SMC_STRICT:
                 has_fvg, has_ob = _improved_fvg_ob(df15, atr15)
                 if has_fvg: score += W_SMC * 0.5; breakdown["FVG+"] = breakdown.get("FVG+", 0.0) + W_SMC*0.5
                 if has_ob:  score += W_SMC * 0.5; breakdown["OB+"]  = breakdown.get("OB+", 0.0) + W_SMC*0.5
                 bos_dir, bos_retest = _bos_choch_strict(df15, 80, 1.2)
                 d["bos_strict"] = int(bos_dir); d["bos_retest_strict"] = bool(bos_retest)
-
             if NEW_RS:
                 try:
                     btc = app.get("market").fetch_ohlcv("BTC/USDT", "5m", 300)
@@ -1184,7 +1195,6 @@ def patch(app: Dict[str, Any]) -> None:
                     d["RS_btc_new"] = rs_btc
                     adj = W_RS if ((side=="LONG" and rs_btc>0) or (side=="SHORT" and rs_btc<0)) else -W_RS/2
                     score += adj; breakdown["RSbtc+"] = breakdown.get("RSbtc+", 0.0) + adj
-
                 rs_eth = None
                 if df5 is not None and eth is not None and len(df5) >= 240 and len(eth) >= 240:
                     ya = df5["close"].astype(float).tail(240).values + 1e-9
@@ -1194,7 +1204,6 @@ def patch(app: Dict[str, Any]) -> None:
                     rs_eth = float(sl)
                 if rs_eth is not None:
                     d["RS_eth_new"] = rs_eth
-
             if NEW_BREADTH:
                 br = _compute_breadth(app, 300)
                 d["breadth"] = br
@@ -1204,7 +1213,6 @@ def patch(app: Dict[str, Any]) -> None:
                     score -= W_BREADTH; breakdown["Breadth"] = breakdown.get("Breadth", 0.0) - W_BREADTH
                 if is_alt and side=="LONG" and br and br.get("pct50_1h", 50.0) > 60.0:
                     score += W_BREADTH*0.5; breakdown["Breadth"] = breakdown.get("Breadth", 0.0) + W_BREADTH*0.5
-
             if NEW_BTC_DOM:
                 trend = _estimate_btc_dom_trend(app)
                 if trend:
@@ -1216,22 +1224,18 @@ def patch(app: Dict[str, Any]) -> None:
                             score += W_BTC_DOM; breakdown["BTC.D"] = breakdown.get("BTC.D", 0.0) + W_BTC_DOM
                         if side=="SHORT" and trend=="up":
                             score -= W_BTC_DOM*0.5; breakdown["BTC.D"] = breakdown.get("BTC.D", 0.0) - W_BTC_DOM*0.5
-
             if NEW_NEWS_LOG:
                 p = _news_logistic_p(d.get("news_note",""))
                 if p is not None:
                     d["news_prob_new"] = p
                     adj = W_NEWS * ((p-0.5) * 2.0)
                     score += adj; breakdown["NewsLog"] = breakdown.get("NewsLog", 0.0) + adj
-
             d["quality_line"] = _append_quality_if_absent("", d)
             d["score_breakdown"] = breakdown
             d["score"] = float(score)
             return float(score), side, d
         app["score_symbol_core"] = _score_new
         logger and logger.info("new: score_symbol_core wrapped (microstructure/regimes/SMC/RS/breadth/news + quality, no HTTP).")
-
-    # ---- Reason wrap (no double 'Качество') ----
     orig_reason = app.get("build_reason")
     if NEW_REASON_WRAP and callable(orig_reason):
         def _build_reason_new(details: Dict[str, Any]) -> str:
@@ -1246,8 +1250,6 @@ def patch(app: Dict[str, Any]) -> None:
                 return base
         app["build_reason"] = _build_reason_new
         logger and logger.info("new: build_reason wrapped (no-duplicate 'Качество').")
-
-    # ---- Trailing wrap (TP tune + regime BE) ----
     if NEW_TRAILING_WRAP and callable(app.get("update_trailing")):
         orig_trailing = app["update_trailing"]
         async def _trailing_new(sig):
@@ -1272,8 +1274,6 @@ def patch(app: Dict[str, Any]) -> None:
                 pass
         app["update_trailing"] = _trailing_new
         logger and logger.info("new: update_trailing wrapped (TP tune + regime-aware BE).")
-
-    # ---- Watch sidecar alerts ----
     orig_watch = app.get("watch_signal_price")
     if NEW_WATCH_SIDECAR and callable(orig_watch):
         async def _watch_wrap(bot, chat_id: int, sig):
@@ -1290,8 +1290,6 @@ def patch(app: Dict[str, Any]) -> None:
                         sidecar.cancel()
         app["watch_signal_price"] = _watch_wrap
         logger and logger.info("new: watch_signal_price wrapped (microstructure alerts).")
-
-    # ---- TA report extras (/tacoin), оффлайн ----
     if NEW_TA_REPORT_WRAP and "ta" in sys.modules:
         t = sys.modules.get("ta")
         if hasattr(t, "_build_tech_report") and callable(t._build_tech_report):
@@ -1332,8 +1330,6 @@ def patch(app: Dict[str, Any]) -> None:
                     return txt
             t._build_tech_report = _build_tech_report_new
             logger and logger.info("new: TA report wrapped (extra HMM/Breadth/Micro, no HTTP).")
-
-    # ---- FINAL SIGNAL SANITY (wrap format_signal_message) ----
     orig_format = app.get("format_signal_message")
     if NEW_FINAL_SIG_FIX and callable(orig_format):
         def _format_msg_new(sig):
@@ -1343,14 +1339,14 @@ def patch(app: Dict[str, Any]) -> None:
                     rsn = getattr(sig, "reason", "") or ""
                     if "TP/SL нормализованы" not in rsn:
                         add = (" • " if rsn else "") + "TP/SL нормализованы"
+                        if "SCALP" in notes and "SCALP" not in rsn:
+                            add += " (SCALP)"
                         sig.reason = (rsn + add)[:950]
             except Exception:
                 pass
             return orig_format(sig)
         app["format_signal_message"] = _format_msg_new
         logger and logger.info("new: format_signal_message wrapped (final SL/TP sanity).")
-
-    # ---- Hook DM TICKER on 'Подробнее' (neon:detail) ----
     try:
         router = app.get("router")
         if router:
@@ -1359,7 +1355,7 @@ def patch(app: Dict[str, Any]) -> None:
             target_cb = None
             for h in handlers:
                 cbf = getattr(h, "callback", None)
-                if getattr(cbf, "__name__", "") == "_h_cb":  # общий обработчик из chat.py
+                if getattr(cbf, "__name__", "") == "_h_cb":
                     target_cb = h
                     break
             if target_cb:
@@ -1378,5 +1374,4 @@ def patch(app: Dict[str, Any]) -> None:
                 logger and logger.info("new: chat._h_cb wrapped (DM ticker on neon:detail).")
     except Exception:
         logger and logger.warning("new: unable to hook DM ticker on neon:detail")
-
     logger and logger.info("new: patch applied.")
