@@ -561,6 +561,7 @@ def patch(app: Dict[str, Any]) -> None:
     - /tacoin (private only)
     - отдельный лимит (ta_count/ta_date)
     - перехват pending до общего fallback
+    - поддержка: кнопка «🛟 Поддержка» в группах/супергруппах (устойчивый матчинг)
     """
     logger = app.get("logger")
     router = app.get("router")
@@ -574,7 +575,7 @@ def patch(app: Dict[str, Any]) -> None:
                 [KeyboardButton(text="🔎 Анализ монеты")],
                 [KeyboardButton(text="🧭 Технический анализ монеты")],
                 [KeyboardButton(text="ℹ️ Помощь")],
-                [KeyboardButton(text="🛟 Поддержка")],
+                [KeyboardButton(text="Поддержка")],
             ]
             return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
         except Exception:
@@ -648,8 +649,6 @@ def patch(app: Dict[str, Any]) -> None:
     # ---- Поддержка (emoji) ----
     async def _h_support_emoji(message: Message):
         try:
-            if getattr(message.chat, "type", None) != "private":
-                return
             db = app.get("db")
             bot = app.get("bot_instance")
             support_kb = app.get("support_kb")
@@ -662,9 +661,15 @@ def patch(app: Dict[str, Any]) -> None:
                     await bot.send_message(message.chat.id, "Напишите ваш вопрос")
         except Exception:
             logger and logger.exception("TA: support emoji handler error")
-    router.message.register(_h_support_emoji, F.chat.type == "private", F.text == "🛟 Поддержка")
 
-    # ---- Fallback wrap: приоритет pending/кнопки ----
+    # 1) Прямой хендлер для групп/супергрупп — устойчивый регэксп (эмодзи/пробелы/регистр)
+    router.message.register(
+        _h_support_emoji,
+        F.chat.type.in_({"group", "supergroup"}),
+        F.text.regexp(r"(?i)^\s*(?:🛟\s*)?поддержка\s*$")
+    )
+
+    # ---- Fallback wrap: приоритет pending/кнопки + поддержка для групп ----
     try:
         obs = router.message
         handlers = getattr(obs, "handlers", [])
@@ -679,18 +684,28 @@ def patch(app: Dict[str, Any]) -> None:
             async def fallback_with_ta(message: Message, bot):
                 try:
                     txt = (message.text or "").strip()
+                    low = txt.lower()
                     uid = message.from_user.id if message.from_user else 0
-                    if getattr(message.chat, "type", None) == "private":
+                    chat_type = getattr(message.chat, "type", None)
+
+                    # Группы: перехват «поддержка» в любом удобном написании
+                    if chat_type in {"group", "supergroup"} and "поддержка" in low:
+                        await _h_support_emoji(message)
+                        return
+
+                    # Приват: приоритет кнопки TA и pending тикера
+                    if chat_type == "private":
                         if txt == "🧭 Технический анализ монеты":
                             await _h_ta_button(message); return
                         if uid in _TA_PENDING and txt and not txt.startswith("/"):
                             await _h_ta_pending(message); return
+
                     await orig_fallback(message, bot)
                 except Exception:
                     with contextlib.suppress(Exception):
                         await orig_fallback(message, bot)
             setattr(target_fb, "callback", fallback_with_ta)
-            logger and logger.info("TA: fallback wrapped (pending first).")
+            logger and logger.info("TA: fallback wrapped (pending first + group support intercept).")
     except Exception as e:
         logger and logger.warning("TA: fallback wrap error: %s", e)
 
