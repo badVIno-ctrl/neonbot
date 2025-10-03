@@ -2,9 +2,12 @@
 # Always-on scanner + hourly digest + channel immediate posts (cap 2/day) + snapshots + simple calibrator
 # + inline p* trainer + /backup (admin-only) + /restore (admin-only) + auto-backup to admins
 # + round-robin scanning + portfolio gate + session threshold adj + adaptive TP-ladder per-asset
+# + model cache (no event loop in thread) + TP/SL sanitize + anti-opposite flip + /bd export+restore
+# + support bridge (“Поддержка” / “🛟 Поддержка”)
+
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple, Optional
-import os, asyncio, contextlib, json, time, math, heapq
+import os, asyncio, contextlib, json, time, math, heapq, tempfile
 from datetime import datetime, timedelta, timezone
 
 from aiogram import F
@@ -55,6 +58,12 @@ SCAN_AUTO_BACKUP_SEC  = int(os.getenv("SCAN_AUTO_BACKUP_SEC", "21600"))
 # adaptive ladder per-asset
 LADDER_ENABLE         = os.getenv("LADDER_ENABLE","1") == "1"
 LADDER_REFRESH_SEC    = int(os.getenv("LADDER_REFRESH_SEC","21600"))
+
+# --- Model cache for ML (avoid event loop in thread) ---
+SCAN_MODEL_TTL_SEC    = int(os.getenv("SCAN_MODEL_TTL_SEC", "600"))
+
+# --- Opposite-post cooldown for channel immediate posts (minutes) ---
+SCAN_OPP_POST_MIN     = int(os.getenv("SCAN_OPP_POST_MIN", "7"))
 
 # фичи для ML
 NUM_KEYS = [k.strip() for k in (os.getenv("SCAN_ML_NUM_KEYS","score,p_bayes,adx15,rr1,rr2,news_boost,vol_z,r2_1h,bbwp,ta_adx15_alt,ta_pre_comp_rank,ta_breakout_disp,ta_mr_risk,ta_near_depth_ratio,spread_norm,book_imb,spoof_score,churn,vpin,ofi,breadth_pct50_1h,basis,ob_imb,cvd_slope,RS_btc,RS_eth").split(","))]
@@ -228,7 +237,8 @@ def _state(app: Dict[str, Any]) -> Dict[str, Any]:
         "top": [],
         "last_digest_at": 0.0,
         "rr_idx": 0,            # round-robin индекс
-        "published": []         # [(ts, symbol, side)]
+        "published": [],        # [(ts, symbol, side)]
+        "last_post": {},        # symbol -> (side, ts)
     })
     return st
 
@@ -251,7 +261,7 @@ def _rank_of(score: float, p_bayes: float, details: Dict[str, Any]) -> float:
     try:
         spr = float(details.get("spread_norm", 0.0) or 0.0)
         spoof = float(details.get("spoof_score", 0.0) or 0.0)
-        near = float(details.get("ta_near_depth_ratio", 0.0) or 0.0)
+        near = float(details.get("ta_near_depth_ratio", details.get("near_depth_ratio", 0.0)) or 0.0)
         if spr > 3.0: r -= 0.05
         if spoof >= 1.0: r -= 0.05
         if near >= 0.6: r += 0.03
@@ -379,6 +389,97 @@ async def _apply_adaptive_tps(app: Dict[str, Any], sig, details: Dict[str, Any])
     except Exception:
         pass
 
+# ------------ SANITIZE LEVELS ------------
+def _sanitize_levels(app: Dict[str, Any], details: Dict[str, Any], symbol: str, side: str) -> None:
+    try:
+        entry = float(details.get("c5") or 0.0)
+        atr   = float(details.get("atr") or 0.0)
+        sl    = float(details.get("sl") or 0.0)
+        tps   = [float(x) for x in (details.get("tps") or [])]
+        if entry <= 0:
+            return
+        market = app.get("market")
+        df15 = market.fetch_ohlcv(symbol, "15m", 240)
+        if atr <= 0 or df15 is None or len(df15) < 20:
+            df1h = market.fetch_ohlcv(symbol, "1h", 360)
+            df5  = market.fetch_ohlcv(symbol, "5m", 360)
+            try:
+                if df15 is not None and len(df15) >= 20:
+                    atr = float((df15["high"] - df15["low"]).rolling(14).mean().iloc[-1])
+                elif df1h is not None and len(df1h) >= 50:
+                    atr = float((df1h["high"] - df1h["low"]).rolling(14).mean().iloc[-1]) / 4.0
+                elif df5 is not None and len(df5) >= 100:
+                    atr = float((df5["high"] - df5["low"]).rolling(14).mean().iloc[-1]) * 3.0
+            except Exception:
+                pass
+            if not (isinstance(atr, (int,float)) and atr > 0):
+                atr = max(1e-9, 0.001 * entry)
+        try:
+            tick = float(market.get_tick_size(symbol) or 0.0)
+        except Exception:
+            tick = 0.0
+        def _rt(x, mode="round"):
+            if tick and tick > 0:
+                n = x / tick
+                if mode == "floor": n = math.floor(n)
+                elif mode == "ceil": n = math.ceil(n)
+                else: n = round(n)
+                return n * tick
+            return x
+        min_r = float(os.getenv("TA_SAN_SL_MIN_ATR", "0.25")) * atr
+        max_r = float(os.getenv("TA_SAN_SL_MAX_ATR", "5.0")) * atr
+        if side == "LONG":
+            if not (sl < entry): sl = entry - min_r
+            risk = abs(entry - sl)
+            if risk < min_r: sl = entry - min_r
+            if risk > max_r: sl = entry - max_r
+            sl = _rt(sl, "floor")
+        else:
+            if not (sl > entry): sl = entry + min_r
+            risk = abs(entry - sl)
+            if risk < min_r: sl = entry + min_r
+            if risk > max_r: sl = entry + max_r
+            sl = _rt(sl, "ceil")
+        bad = (
+            not tps or
+            len({round(x, 10) for x in tps}) < 3 or
+            any(x <= 0 for x in tps) or
+            (max(abs(x - entry) for x in tps) / (atr + 1e-9) > 8.0)
+        )
+        m1, m2, m3 = 0.8, 1.5, 2.4
+        if bad:
+            tps = [entry + m1*atr, entry + m2*atr, entry + m3*atr] if side == "LONG" else \
+                  [entry - m1*atr, entry - m2*atr, entry - m3*atr]
+        step = float(os.getenv("TA_SAN_TP_MIN_STEP_ATR", "0.15")) * atr
+        if side == "LONG":
+            tps = sorted(tps)
+            tps[0] = max(tps[0], entry + step)
+            tps[1] = max(tps[1], tps[0] + step)
+            tps[2] = max(tps[2], tps[1] + step)
+            tps = [_rt(x, "ceil") for x in tps]
+        else:
+            tps = sorted(tps, reverse=True)
+            tps[0] = min(tps[0], entry - step)
+            tps[1] = min(tps[1], tps[0] - step)
+            tps[2] = min(tps[2], tps[1] - step)
+            tps = [_rt(x, "floor") for x in tps]
+        if len({round(x, 10) for x in tps}) < 3:
+            step_tick = max(tick, 1e-12) * 2.0
+            if side == "LONG":
+                tps = sorted(tps)
+                for i in range(1, len(tps)):
+                    if tps[i] <= tps[i-1]:
+                        tps[i] = _rt(tps[i-1] + step_tick, "ceil")
+            else:
+                tps = sorted(tps, reverse=True)
+                for i in range(1, len(tps)):
+                    if tps[i] >= tps[i-1]:
+                        tps[i] = _rt(tps[i-1] - step_tick, "floor")
+        details["sl"]  = float(sl)
+        details["tps"] = [float(x) for x in tps[:3]]
+    except Exception:
+        pass
+
 # ------------ PUBLISH ------------
 async def _publish_immediate(app: Dict[str, Any], cand: Dict[str, Any]) -> bool:
     bot = app.get("bot_instance")
@@ -387,9 +488,28 @@ async def _publish_immediate(app: Dict[str, Any], cand: Dict[str, Any]) -> bool:
     try:
         if not _can_publish_portfolio(app, cand["side"]):
             return False
+
+        # Anti‑opposite cooldown per symbol
+        st = _state(app)
+        last_map = st.setdefault("last_post", {})
+        now_ts = time.time()
+        prev = last_map.get(cand["symbol"])
+        if prev:
+            prev_side, prev_ts = prev
+            if cand["side"] != prev_side and (now_ts - prev_ts) < SCAN_OPP_POST_MIN * 60:
+                return False
+
         Signal = app.get("Signal"); build_reason = app.get("build_reason"); fmt = app.get("format_signal_message")
         if not (Signal and fmt): return False
-        d = cand["details"]; reason = ""
+
+        # Санитация уровней в деталях перед сборкой сигнала
+        d = cand["details"]
+        try:
+            _sanitize_levels(app, d, cand["symbol"], cand["side"])
+        except Exception:
+            pass
+
+        reason = ""
         with contextlib.suppress(Exception): reason = build_reason(d) or ""
         sig = Signal(
             user_id=0, symbol=cand["symbol"], side=cand["side"],
@@ -399,15 +519,17 @@ async def _publish_immediate(app: Dict[str, Any], cand: Dict[str, Any]) -> bool:
             reason=reason
         )
         await _apply_adaptive_tps(app, sig, d)
+
         text = fmt(sig) + "\n\n🤖 Опубликовано автоматически • NEON Bot"
         await bot.send_message(CHANNEL_USERNAME, text, disable_web_page_preview=True)
         await _inc_channel_cap(app, cand["symbol"], cand["side"])
         _append_published(app, cand["symbol"], cand["side"])
+        last_map[cand["symbol"]] = (cand["side"], time.time())
         return True
     except Exception:
         return False
 
-# ------------ MAIN LOOPS ------------
+# ------------ SCAN LOOP ------------
 async def _scan_loop(app: Dict[str, Any]):
     await _ensure_scan_tables(app)
     logger = app.get("logger"); syms = app.get("SYMBOLS", [])
@@ -457,6 +579,7 @@ async def _scan_loop(app: Dict[str, Any]):
             logger and logger.warning("Scanner loop error: %s", e)
             await asyncio.sleep(5)
 
+# ------------ DIGEST LOOP ------------
 async def _digest_loop(app: Dict[str, Any]):
     logger = app.get("logger"); bot = app.get("bot_instance")
     if not bot: return
@@ -651,7 +774,8 @@ def _predict_p(model: Dict[str, Any], row_raw: List[float]) -> float:
         return 0.55
 
 async def _train_loop(app: Dict[str, Any]):
-    await _ensure_scan_tables(app); logger = app.get("logger")
+    await _ensure_scan_tables(app)
+    logger = app.get("logger")
     await asyncio.sleep(15)
     while True:
         try:
@@ -706,7 +830,8 @@ def _wrap_score_with_ml(app: Dict[str, Any]):
         if base is None: return None
         score, side, details = base; details = dict(details or {})
         p_base = float(details.get("p_bayes", details.get("ml_p", 0.55)) or 0.55)
-        mdl = asyncio.get_event_loop().run_until_complete(_load_model_db(app))
+        cache = app.setdefault("_scan_model_cache", {"ts": 0.0, "model": None})
+        mdl = cache.get("model")
         p_ml = None
         try:
             if mdl and mdl.get("kind") in ("linlogit","sk","lgbm"):
@@ -717,11 +842,14 @@ def _wrap_score_with_ml(app: Dict[str, Any]):
             p_star = float(ML_BLEND_W * p_ml + (1.0 - ML_BLEND_W) * p_base)
             details["p_ml"] = float(p_ml); details["p_bayes"] = float(p_star)
             score = float(score + (p_star - p_base) * 0.8)
+        try:
+            _sanitize_levels(app, details, symbol, side)
+        except Exception:
+            pass
         return float(score), side, details
     app["score_symbol_core"] = _score_ml
     logger and logger.info("Scanner-ML: score patched (blend p_ml into p*).")
 
-# -------- Снимок фич (для /signal) --------
 def _patch_cmd_signal_snapshot(app: Dict[str, Any]):
     logger = app.get("logger"); router = app.get("router")
     if not router: return
@@ -753,7 +881,6 @@ def _patch_cmd_signal_snapshot(app: Dict[str, Any]):
     except Exception:
         pass
 
-# -------- /backup (admin-only) + fallback intercept --------
 def _patch_backup_command(app: Dict[str, Any]):
     router = app.get("router"); logger = app.get("logger")
     if not router: return
@@ -778,9 +905,7 @@ def _patch_backup_command(app: Dict[str, Any]):
                 await bot.send_document(message.chat.id, doc, caption=f"Бэкап БД ({size_kb} KB)")
         except Exception:
             with contextlib.suppress(Exception): await message.answer("Ошибка бэкапа.")
-    # Command handler
     router.message.register(_h_backup, Command("backup"))
-    # Fallback intercept (если попадает в общий fallback)
     try:
         obs = router.message; handlers = getattr(obs, "handlers", [])
         target_fb = None
@@ -801,7 +926,6 @@ def _patch_backup_command(app: Dict[str, Any]):
         pass
     logger and logger.info("Scanner: /backup registered.")
 
-# -------- /restore (admin-only) + fallback intercept --------
 def _patch_restore_command(app: Dict[str, Any]):
     router = app.get("router"); logger = app.get("logger")
     if not router: return
@@ -837,10 +961,8 @@ def _patch_restore_command(app: Dict[str, Any]):
         if not caption.startswith("/restore"):
             return
         await _do_restore_from_doc(message, message.document)
-    # Command + document handlers
     router.message.register(_h_restore_cmd, Command("restore"))
     router.message.register(_h_restore_doc, F.document)
-    # Fallback intercept
     try:
         obs = router.message; handlers = getattr(obs, "handlers", [])
         target_fb = None
@@ -861,7 +983,188 @@ def _patch_restore_command(app: Dict[str, Any]):
         pass
     logger and logger.info("Scanner: /restore registered.")
 
-# -------- Авто-бэкап в личку админам --------
+async def _ensure_users_columns_for_bd(app: Dict[str, Any]) -> None:
+    db = app.get("db")
+    if not db or not getattr(db, "conn", None):
+        return
+    cols = [
+        "ALTER TABLE users ADD COLUMN pro_until TEXT",
+        "ALTER TABLE users ADD COLUMN pro_notified INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN pro_pre_notified INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN city TEXT",
+        "ALTER TABLE users ADD COLUMN last_seen TEXT",
+        "ALTER TABLE users ADD COLUMN ta_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN ta_date TEXT",
+        "ALTER TABLE users ADD COLUMN analysis_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN analysis_date TEXT",
+    ]
+    for s in cols:
+        with contextlib.suppress(Exception):
+            await db.conn.execute(s)
+    with contextlib.suppress(Exception):
+        await db.conn.commit()
+
+async def _fetch_users_snapshot(app: Dict[str, Any]) -> List[Dict[str, Any]]:
+    await _ensure_users_columns_for_bd(app)
+    db = app.get("db")
+    rows_out: List[Dict[str, Any]] = []
+    try:
+        cur = await db.conn.execute("""
+            SELECT user_id, date, count, unlimited, support_mode, admin,
+                   pro_until, pro_notified, pro_pre_notified, city,
+                   ta_count, ta_date, analysis_count, analysis_date, last_seen
+            FROM users
+        """)
+        rows = await cur.fetchall()
+        for r in rows or []:
+            rows_out.append({k: r[k] for k in r.keys()})
+    except Exception:
+        pass
+    return rows_out
+
+async def _apply_users_snapshot(app: Dict[str, Any], users: List[Dict[str, Any]]) -> int:
+    await _ensure_users_columns_for_bd(app)
+    db = app.get("db"); applied = 0
+    if not users:
+        return 0
+    try:
+        for u in users:
+            try:
+                vals = {
+                    "user_id": int(u.get("user_id")),
+                    "date": str(u.get("date") or ""),
+                    "count": int(u.get("count") or 0),
+                    "unlimited": int(u.get("unlimited") or 0),
+                    "support_mode": int(u.get("support_mode") or 0),
+                    "admin": int(u.get("admin") or 0),
+                    "pro_until": u.get("pro_until"),
+                    "pro_notified": int(u.get("pro_notified") or 0),
+                    "pro_pre_notified": int(u.get("pro_pre_notified") or 0),
+                    "city": u.get("city"),
+                    "ta_count": int(u.get("ta_count") or 0),
+                    "ta_date": u.get("ta_date"),
+                    "analysis_count": int(u.get("analysis_count") or 0),
+                    "analysis_date": u.get("analysis_date"),
+                    "last_seen": u.get("last_seen"),
+                }
+            except Exception:
+                continue
+            await db.conn.execute("""
+                INSERT INTO users(user_id, date, count, unlimited, support_mode, admin, pro_until, pro_notified, pro_pre_notified, city, ta_count, ta_date, analysis_count, analysis_date, last_seen)
+                VALUES (:user_id, :date, :count, :unlimited, :support_mode, :admin, :pro_until, :pro_notified, :pro_pre_notified, :city, :ta_count, :ta_date, :analysis_count, :analysis_date, :last_seen)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    date=excluded.date,
+                    count=excluded.count,
+                    unlimited=excluded.unlimited,
+                    support_mode=excluded.support_mode,
+                    admin=excluded.admin,
+                    pro_until=excluded.pro_until,
+                    pro_notified=excluded.pro_notified,
+                    pro_pre_notified=excluded.pro_pre_notified,
+                    city=excluded.city,
+                    ta_count=excluded.ta_count,
+                    ta_date=excluded.ta_date,
+                    analysis_count=excluded.analysis_count,
+                    analysis_date=excluded.analysis_date,
+                    last_seen=excluded.last_seen
+            """, vals)
+            applied += 1
+        await db.conn.commit()
+    except Exception:
+        pass
+    return applied
+
+def _patch_bd_command(app: Dict[str, Any]):
+    router = app.get("router"); logger = app.get("logger")
+    if not router: return
+
+    async def _h_bd(message: Message):
+        try:
+            db = app.get("db"); bot = app.get("bot_instance")
+            if not db or not getattr(db,"conn",None) or not bot:
+                with contextlib.suppress(Exception): await message.answer("Сервис БД недоступен.")
+                return
+            admins = []
+            with contextlib.suppress(Exception): admins = await db.get_admin_user_ids()
+            if message.from_user.id not in (admins or []):
+                with contextlib.suppress(Exception): await message.answer("Доступно только администраторам.")
+                return
+            users = await _fetch_users_snapshot(app)
+            data = json.dumps({"exported_at": app["now_msk"]().isoformat(), "users": users}, ensure_ascii=False, indent=2)
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tmp:
+                tmp.write(data)
+                path = tmp.name
+            doc = FSInputFile(path, filename="users_export.json")
+            await bot.send_document(message.chat.id, doc, caption=f"Экспорт пользователей ({len(users)})")
+        except Exception:
+            with contextlib.suppress(Exception): await message.answer("Ошибка экспорта /bd.")
+
+    async def _bd_restore_from_doc(message: Message, doc):
+        try:
+            db = app.get("db"); bot = app.get("bot_instance")
+            if not db or not getattr(db,"conn",None) or not bot:
+                with contextlib.suppress(Exception): await message.answer("Сервис БД недоступен.")
+                return
+            admins = []
+            with contextlib.suppress(Exception): admins = await db.get_admin_user_ids()
+            if message.from_user.id not in (admins or []):
+                with contextlib.suppress(Exception): await message.answer("Доступно только администраторам.")
+                return
+            with tempfile.TemporaryDirectory() as td:
+                target = os.path.join(td, "users_import.json")
+                await bot.download(doc, destination=target)
+                obj = None
+                with open(target, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
+                users = obj.get("users") if isinstance(obj, dict) else None
+                if not isinstance(users, list):
+                    await message.answer("Формат не распознан. Ожидается JSON с ключом 'users'."); return
+                applied = await _apply_users_snapshot(app, users)
+                await message.answer(f"✅ Импортировано/обновлено пользователей: {applied}")
+        except Exception:
+            with contextlib.suppress(Exception): await message.answer("Ошибка импорта /bd_restore.")
+
+    async def _h_bd_restore_cmd(message: Message):
+        if getattr(message, "reply_to_message", None) and getattr(message.reply_to_message, "document", None):
+            await _bd_restore_from_doc(message, message.reply_to_message.document)
+        else:
+            with contextlib.suppress(Exception):
+                await message.answer("Пришлите JSON (users_export.json) и ответьте на него командой /bd_restore, либо отправьте документ с подписью /bd_restore.")
+
+    async def _h_bd_restore_doc(message: Message):
+        if not getattr(message, "document", None):
+            return
+        caption = (message.caption or "").strip().lower()
+        if not caption.startswith("/bd_restore"):
+            return
+        await _bd_restore_from_doc(message, message.document)
+
+    router.message.register(_h_bd, Command("bd"))
+    router.message.register(_h_bd_restore_cmd, Command("bd_restore"))
+    router.message.register(_h_bd_restore_doc, F.document)
+
+    try:
+        obs = router.message; handlers = getattr(obs, "handlers", [])
+        target_fb = None
+        for h in handlers:
+            cb = getattr(h, "callback", None)
+            if cb and "fallback" in getattr(cb, "__name__", ""):
+                target_fb = h; break
+        if target_fb:
+            orig_fb = target_fb.callback
+            async def fb_wrap(message: Message, bot):
+                text = (message.text or "").strip().lower()
+                if text.startswith("/bd"):
+                    await _h_bd(message); return
+                if text.startswith("/bd_restore"):
+                    await _h_bd_restore_cmd(message); return
+                return await orig_fb(message, bot)
+            setattr(target_fb, "callback", fb_wrap)
+            logger and logger.info("Scanner: fallback wrapped for /bd and /bd_restore.")
+    except Exception:
+        pass
+    logger and logger.info("Scanner: /bd + /bd_restore registered.")
+
 async def _auto_backup_loop(app: Dict[str, Any]):
     await asyncio.sleep(10)
     db = app.get("db"); bot = app.get("bot_instance"); logger = app.get("logger")
@@ -885,13 +1188,58 @@ async def _auto_backup_loop(app: Dict[str, Any]):
             logger and logger.warning("Auto-backup loop error: %s", e)
             await asyncio.sleep(60)
 
-# -------- PATCH ENTRY --------
+async def _refresh_model_cache_loop(app: Dict[str, Any]):
+    app["_scan_model_cache"] = {"ts": 0.0, "model": None}
+    while True:
+        try:
+            mdl = await _load_model_db(app)
+            app["_scan_model_cache"] = {"ts": time.time(), "model": mdl}
+        except Exception:
+            pass
+        await asyncio.sleep(max(60, SCAN_MODEL_TTL_SEC))
+
+def _patch_support_bridge(app: Dict[str, Any]):
+    router = app.get("router"); logger = app.get("logger")
+    if not router:
+        return
+
+    _bridge_state = app.setdefault("_support_bridge", {})  # user_id -> last_ts
+
+    async def _h_support_bridge(message: Message):
+        try:
+            uid = int(getattr(message.from_user, "id", 0) or 0)
+            now = time.time()
+            last = float(_bridge_state.get(uid, 0.0))
+            if now - last < 2.0:
+                return
+            _bridge_state[uid] = now
+            db = app.get("db"); bot = app.get("bot_instance")
+            support_kb = app.get("support_kb")
+            if db and getattr(db, "conn", None):
+                await db.set_support_mode(uid, True)
+            if bot:
+                if callable(support_kb):
+                    await bot.send_message(message.chat.id, "Напишите ваш вопрос", reply_markup=support_kb())
+                else:
+                    await bot.send_message(message.chat.id, "Напишите ваш вопрос")
+        except Exception:
+            pass
+
+    router.message.register(
+        _h_support_bridge,
+        F.chat.type == "private",
+        F.text.in_({"Поддержка", "Поддержка"})
+    )
+    logger and logger.info("Scanner: support bridge registered (emoji and plain).")
+
 def patch(app: Dict[str, Any]) -> None:
     logger = app.get("logger")
     _wrap_score_with_ml(app)
     _patch_cmd_signal_snapshot(app)
     _patch_backup_command(app)
     _patch_restore_command(app)
+    _patch_bd_command(app)
+    _patch_support_bridge(app)
     orig_on_startup = app.get("on_startup")
     async def _on_startup_scanner(bot):
         await _ensure_scan_tables(app)
@@ -901,7 +1249,8 @@ def patch(app: Dict[str, Any]) -> None:
         asyncio.create_task(_train_loop(app))
         asyncio.create_task(_auto_backup_loop(app))
         asyncio.create_task(_refresh_ladder_loop(app))
+        asyncio.create_task(_refresh_model_cache_loop(app))
         if orig_on_startup:
             await orig_on_startup(bot)
     app["on_startup"] = _on_startup_scanner
-    logger and logger.info("Scanner: patch applied (scan+digest+calibrator+inline ML+/backup+/restore+auto-backup+RR+portfolio+session+ladder).")
+    logger and logger.info("Scanner: patch applied (scan+digest+calibrator+inline ML+/backup+/restore+/bd+support-bridge+unified-fallback+auto-backup+RR+portfolio+session+ladder+model-cache+sanitize+anti-flip).")
